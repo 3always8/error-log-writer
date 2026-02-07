@@ -1,0 +1,10 @@
+{
+	"id": "error-log-writer",
+	"name": "Error Log Writer",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Generate error logs from images using Gemini API.",
+	"author": "3always8",
+	"authorUrl": "https://github.com/3always8",
+	"isDesktopOnly": false
+}
