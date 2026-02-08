@@ -28,14 +28,14 @@ export default class ErrorLogPlugin extends Plugin {
 	async batchProcessImages(files: TFile[]) {
 		if (files.length === 0) return;
 		new Notice(`총 ${files.length}개의 파일 분석 시작! 🏃`);
-        
+
         let allProblems: ProblemItem[] = [];
 
 		for (let i = 0; i < files.length; i++) {
 			const file = files[i];
 			if (!file) continue;
 			new Notice(`[${i + 1}/${files.length}] AI 분석 중: ${file.name}`);
-			
+
 			const problems = await this.processFile(file);
             if (problems && problems.length > 0) {
                 allProblems.push(...problems);
@@ -57,16 +57,16 @@ export default class ErrorLogPlugin extends Plugin {
 			const arrayBuffer = await this.app.vault.readBinary(file);
 			const base64Data = Buffer.from(arrayBuffer).toString('base64');
 			const mimeType = file.extension.toLowerCase() === 'pdf' ? 'application/pdf' : 'image/png';
-			
-			const modelName = this.settings?.modelName || "gemini-2.0-flash"; 
+
+			const modelName = this.settings?.modelName || "gemini-2.0-flash";
 			const model = this.genAI.getGenerativeModel({ model: modelName });
-			
+
             // 🔥 [Change] 지저분한 문자열 대신 변수 하나만 쏙!
 			const result = await model.generateContent([
 				CPA_GRADER_PROMPT,
 				{ inlineData: { data: base64Data, mimeType: mimeType } }
 			]);
-			
+
 			let problems: any[] = [];
 			try {
 				problems = this.parseRoughJson(result.response.text());
@@ -87,8 +87,6 @@ export default class ErrorLogPlugin extends Plugin {
 		}
 	}
 
-    // ... (saveToMarkdown, sanitizeForTable, appendToLogFile 등 하단 로직은 기존과 동일하므로 생략하지 않고 그대로 유지하세요)
-    // 편의를 위해 saveToMarkdown만 다시 적어드립니다. 나머지는 그대로 두셔도 됩니다.
 	async saveToMarkdown(items: ProblemItem[]) {
 		const { vault } = this.app;
 		const targetPath = this.settings.targetNotePath;
@@ -98,8 +96,6 @@ export default class ErrorLogPlugin extends Plugin {
 			const header = `---
 cssclasses: cpa-log
 ---
-
-# 📝 CPA Error Log
 
 | 과목 | 문제 | 번호 | 정답 | 풀이 |
 |:---:|:---|:---:|:---:|:---|
@@ -115,13 +111,16 @@ cssclasses: cpa-log
                 const safeSubject = this.sanitizeForTable(item.subject || "기타");
                 const safeAnswer = this.sanitizeForTable(item.answer || "");
                 const safeSolution = this.sanitizeForTable(item.solution || "");
-                const scrollableSolution = `<div style="max-height: 300px; overflow-y: auto;">${safeSolution}</div>`;
+                
+                // 🔥 [수정] 인라인 스타일 제거 -> 클래스(cpa-solution) 적용
+                // 이제 CSS가 이 div를 완벽하게 통제합니다.
+                const scrollableSolution = `<div class="cpa-solution">${safeSolution}</div>`;
 
                 const showImage = (item.imageFile !== currentFile);
                 currentFile = item.imageFile;
 
                 const imageContent = showImage 
-                    ? `<div style="min-height: 100px; display: flex; align-items: center; justify-content: center;">![[${item.imageFile.name}]]</div>` 
+                    ? `<div class="cpa-img-container">![[${item.imageFile.name}]]</div>` 
                     : '';
 
                 chunk += `| ${safeSubject} | ${imageContent} | ${item.question_number} | ${safeAnswer} | ${scrollableSolution} |\n`;
@@ -129,21 +128,42 @@ cssclasses: cpa-log
 			await vault.append(logFile, chunk);
 		}
 	}
-
+	
 	parseRoughJson(text: string): any[] {
+		// 1. 마크다운 코드블록 제거
 		let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+
+		// 2. 가장 바깥쪽 대괄호([]) 찾기 (앞뒤 사족 제거)
 		const start = clean.indexOf('[');
 		const end = clean.lastIndexOf(']');
-		if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
-		clean = clean.replace(/,(\s*\])/g, '$1'); 
-		return JSON.parse(clean);
+
+		if (start === -1 || end === -1) {
+			throw new Error("JSON Array brackets not found");
+		}
+
+		clean = clean.substring(start, end + 1);
+
+		// 3. 🔥 [핵심] Trailing Comma(마지막 콤마) 제거
+		// 예: [ {...}, {...}, ]  ->  [ {...}, {...} ]
+		// JSON 표준은 마지막 콤마를 허용하지 않아서 에러가 납니다. 이걸 정규식으로 고칩니다.
+		clean = clean.replace(/,(\s*\])/g, '$1');
+
+		try {
+			return JSON.parse(clean);
+		} catch (e) {
+			console.error("1차 파싱 실패. Trailing Comma 추가 제거 시도...");
+			// 혹시 객체 내부의 콤마 에러일 수도 있으니 한 번 더 강제 청소
+			// (},]) 패턴을 찾아서 콤마를 제거
+			clean = clean.replace(/,\s*}/g, '}');
+			return JSON.parse(clean);
+		}
 	}
 
 	sanitizeForTable(text: string): string {
 		if (!text) return "";
-		return text.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\|/g, '&#124;').replace(/\t/g, ' '); 
+		return text.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\|/g, '&#124;').replace(/\t/g, ' ');
 	}
-    
+
 	async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
 	async saveSettings() { await this.saveData(this.settings); if (this.settings.geminiApiKey) this.genAI = new GoogleGenerativeAI(this.settings.geminiApiKey); }
 }
@@ -174,7 +194,7 @@ class ErrorLogSettingTab extends PluginSettingTab {
 	constructor(app: App, plugin: ErrorLogPlugin) { super(app, plugin); this.plugin = plugin; }
 
 	display(): void {
-		const {containerEl} = this; 
+		const {containerEl} = this;
 		containerEl.empty();
 
 		new Setting(containerEl)
@@ -183,31 +203,31 @@ class ErrorLogSettingTab extends PluginSettingTab {
 			.addText(t => t
 				.setPlaceholder('Enter your API Key')
 				.setValue(this.plugin.settings.geminiApiKey)
-				.onChange(async v => { 
-					this.plugin.settings.geminiApiKey = v; 
-					await this.plugin.saveSettings(); 
+				.onChange(async v => {
+					this.plugin.settings.geminiApiKey = v;
+					await this.plugin.saveSettings();
 				}));
-		
+
 		const modelSetting = new Setting(containerEl)
 			.setName('Gemini Model')
 			.setDesc('사용할 모델을 선택하세요. (🔄 버튼을 누르면 최신 모델 목록을 가져옵니다)')
 			.addDropdown(async (d) => {
 				// 1. 기본값 세팅 (설정 파일에 저장된 값 or 기본값)
 				const current = this.plugin.settings.modelName;
-				
+
 				// 기본 옵션들을 먼저 채움 (혹시 API 호출 실패할 경우 대비)
 				let opts: Record<string, string> = { ...DEFAULT_MODELS };
-				
+
 				// 만약 현재 설정된 모델이 기본 목록에 없으면(예: 신규 모델) 추가해서 보여줌
 				if (current && !opts[current]) {
 					opts[current] = `${current} (Current)`;
 				}
-				
+
 				d.addOptions(opts)
 				 .setValue(current)
-				 .onChange(async v => { 
-					 this.plugin.settings.modelName = v; 
-					 await this.plugin.saveSettings(); 
+				 .onChange(async v => {
+					 this.plugin.settings.modelName = v;
+					 await this.plugin.saveSettings();
 				 });
 			});
 
@@ -216,31 +236,31 @@ class ErrorLogSettingTab extends PluginSettingTab {
 			btn.setIcon('sync')
 			   .setTooltip('Fetch available models from Google')
 			   .onClick(async () => {
-				   if (!this.plugin.settings.geminiApiKey) { 
-					   new Notice('⚠️ API Key가 필요합니다.'); 
-					   return; 
+				   if (!this.plugin.settings.geminiApiKey) {
+					   new Notice('⚠️ API Key가 필요합니다.');
+					   return;
 				   }
 
 				   new Notice('Fetching models... ⏳');
-				   
+
 				   try {
 					   // 1. Gemini API에 모델 목록 요청
 					   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${this.plugin.settings.geminiApiKey}`);
-					   
+
 					   if (!response.ok) {
 						   throw new Error(`API Error: ${response.statusText}`);
 					   }
-					   
+
 					   const data = await response.json();
-					   
+
 					   // 2. 모델 필터링: "generateContent" 기능이 있는 모델만 + "gemini" 이름 포함
 					   // (embedding 모델이나 구형 모델 제외)
-					   const validModels = data.models.filter((m: any) => 
-						   m.name.includes('gemini') && 
-						   m.supportedGenerationMethods && 
+					   const validModels = data.models.filter((m: any) =>
+						   m.name.includes('gemini') &&
+						   m.supportedGenerationMethods &&
 						   m.supportedGenerationMethods.includes('generateContent')
 					   );
-					   
+
 					   if (validModels.length === 0) {
 						   new Notice('사용 가능한 Gemini 모델을 찾을 수 없습니다.');
 						   return;
@@ -250,7 +270,7 @@ class ErrorLogSettingTab extends PluginSettingTab {
 					   const dropdownEl = modelSetting.controlEl.querySelector('select') as HTMLSelectElement;
 					   if (dropdownEl) {
 						   dropdownEl.innerHTML = ''; // 기존 목록 초기화
-						   
+
 						   // 받아온 모델들 추가
 						   validModels.forEach((m: any) => {
 							   // 이름이 'models/gemini-1.5-flash' 형태이므로 앞부분 제거
@@ -260,25 +280,25 @@ class ErrorLogSettingTab extends PluginSettingTab {
 							   option.text = `${m.displayName} (${m.version || 'latest'})`;
 							   dropdownEl.add(option);
 						   });
-						   
+
 						   // 현재 선택된 값이 목록에 있으면 유지, 없으면 첫 번째 모델 선택
 						   const current = this.plugin.settings.modelName;
 						   let exists = false;
-						   for(let i=0; i<dropdownEl.options.length; i++) { 
-							   if(dropdownEl.options.item(i)?.value === current) exists = true; 
+						   for(let i=0; i<dropdownEl.options.length; i++) {
+							   if(dropdownEl.options.item(i)?.value === current) exists = true;
 						   }
-						   
+
 						   // 만약 목록에 내 설정값이 없다면(커스텀 모델 등), 강제로 추가해서 선택 유지
-						   if (!exists) { 
-							   const opt = document.createElement('option'); 
-							   opt.value = current; 
-							   opt.text = `${current} (Keep Current)`; 
-							   dropdownEl.add(opt); 
+						   if (!exists) {
+							   const opt = document.createElement('option');
+							   opt.value = current;
+							   opt.text = `${current} (Keep Current)`;
+							   dropdownEl.add(opt);
 						   }
-						   
+
 						   dropdownEl.value = current;
 					   }
-					   
+
 					   new Notice(`✅ ${validModels.length}개의 모델을 불러왔습니다!`);
 
 				   } catch (error) {
@@ -293,9 +313,9 @@ class ErrorLogSettingTab extends PluginSettingTab {
 			.setDesc('오답노트가 저장될 파일명입니다.')
 			.addText(t => t
 				.setValue(this.plugin.settings.targetNotePath)
-				.onChange(async v => { 
-					this.plugin.settings.targetNotePath = v; 
-					await this.plugin.saveSettings(); 
+				.onChange(async v => {
+					this.plugin.settings.targetNotePath = v;
+					await this.plugin.saveSettings();
 				}));
 	}
 }
