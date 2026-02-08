@@ -1,0 +1,56 @@
+/* styles.css */
+
+/* 1. 테이블 레이아웃 - 고정폭 */
+.cpa-log table {
+    table-layout: fixed !important;
+    width: 100% !important;
+    border-collapse: collapse;
+}
+
+/* 2. 컬럼 너비 설정 (기존과 동일) */
+.cpa-log th:nth-child(1), .cpa-log td:nth-child(1) { width: 9%; text-align: center !important; } /* 과목 */
+.cpa-log th:nth-child(2), .cpa-log td:nth-child(2) { width: 50%; } /* 문제 */
+.cpa-log th:nth-child(3), .cpa-log td:nth-child(3) { width: 4%; text-align: center !important; } /* 번호 */
+.cpa-log th:nth-child(4), .cpa-log td:nth-child(4) { width: 7%; text-align: center !important; } /* 정답 */
+.cpa-log th:nth-child(5), .cpa-log td:nth-child(5) { width: 30%; } /* 풀이 */
+
+/* 3. 이미지 평소 상태 */
+.markdown-preview-view.cpa-log img,
+.markdown-source-view.cpa-log img {
+    width: 100%;
+    height: auto;
+    object-fit: contain;
+    display: block;
+    margin: 0 auto;
+    cursor: zoom-in;
+    transition: none; /* 즉각 반응 */
+}
+
+/* 4. 🔥 [핵심 변경] 마우스 올렸을 때 -> 왼쪽 고정 (Split Screen) */
+.markdown-preview-view.cpa-log img:hover,
+.markdown-source-view.cpa-log img:hover {
+    position: fixed !important; /* 문서 탈출 */
+    
+    /* 🔥 왼쪽 정렬 */
+    left: 2px;
+    top: 50%;
+    transform: translateY(-50%); /* 세로만 중앙 정렬 */
+    
+    /* 🔥 화면의 절반만 차지 (오른쪽 풀이 가리지 않음) */
+    width: 65vw !important; 
+    height: auto !important;
+    max-height: 98vh; /* 세로는 꽉 차게 */
+    
+    /* 스타일링 */
+    z-index: 99999 !important;
+    background-color: var(--background-primary);
+    border: 3px solid var(--interactive-accent);
+    border-radius: 8px;
+    
+    /* 오른쪽으로 그림자를 줘서 구분감 형성 */
+    box-shadow: 10px 0 30px rgba(0, 0, 0, 0.5); 
+}
+
+/* 5. 스크롤바 */
+.cpa-log div::-webkit-scrollbar { width: 8px; }
+.cpa-log div::-webkit-scrollbar-thumb { background-color: var(--scrollbar-thumb-bg); border-radius: 4px; }
