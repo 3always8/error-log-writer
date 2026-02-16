@@ -1,100 +1,54 @@
-/* styles.css */
+/* ... (위쪽 테이블 레이아웃은 기존 유지) ... */
 
-/* 1. 테이블 레이아웃 - 강력 고정 */
-.cpa-log table {
-    table-layout: fixed !important;
-    width: 100% !important;
-    border-collapse: collapse;
-    box-sizing: border-box; /* 테두리 포함 크기 계산 */
+/* [글자 겹침 해결] 텍스트 렌더링 최적화 */
+.cpa-log, .cpa-solution, .cpa-text {
+    font-variant-ligatures: none !important; /* 글자 뭉침 방지 */
+    text-rendering: optimizeLegibility !important; /* 가독성 우선 */
+    letter-spacing: normal !important; /* 자간 초기화 */
+    font-kerning: normal !important;
+
+    /* 한글/영문 섞임 문제 완화 */
+    word-break: break-all;
+    white-space: pre-wrap;
 }
 
-/* 2. 컬럼 너비 설정 */
-.cpa-log th:nth-child(1), .cpa-log td:nth-child(1) { width: 10%; text-align: center !important; }
-.cpa-log th:nth-child(2), .cpa-log td:nth-child(2) { 
-    width: 40%; 
-    overflow: visible !important; 
-    position: static !important;
-    box-sizing: border-box;
-    padding: 0 !important; /* 패딩으로 인한 너비 변화 방지 */
+/* 수식($) 주변 여백 확보 */
+.cpa-solution .MathJax, .cpa-solution .mjx-chtml {
+    margin: 0 2px !important;
 }
-.cpa-log th:nth-child(3), .cpa-log td:nth-child(3) { width: 5%; text-align: center !important; }
-.cpa-log th:nth-child(4), .cpa-log td:nth-child(4) { width: 5%; text-align: center !important; }
-.cpa-log th:nth-child(5), .cpa-log td:nth-child(5) { width: 40%; }
 
-
-/* 3. 이미지 컨테이너 (부동의 빈 방) */
-/* 🔥 Mouse Hover의 기준점이 됩니다. 절대 크기가 변하지 않습니다. */
-.cpa-img-container {
-    height: 250px; 
+/* 이미지 평소 상태 (수정) */
+.cpa-img-container img {
     width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: visible !important; 
-    position: static !important; 
-    z-index: auto;
-    background-color: transparent; /* 배경 투명 */
-}
-
-/* 4. 풀이 영역 */
-.cpa-solution {
-    max-height: 300px;
-    overflow-y: auto;
-    overflow-x: hidden;
-    width: 100%;
-    white-space: normal !important;
-    word-break: break-word;
-    overflow-wrap: break-word;
-}
-
-/* 5. 옵시디언 내부 껍데기 무력화 */
-.markdown-preview-view.cpa-log span.internal-embed,
-.markdown-source-view.cpa-log span.internal-embed {
-    overflow: visible !important;
-    display: flex !important; /* inline-block 대신 flex로 변경하여 높이 계산 안정화 */
-    justify-content: center;
-    width: 100% !important;
-    height: 100% !important;
-}
-
-/* 6. 이미지 평소 상태 */
-.markdown-preview-view.cpa-log img,
-.markdown-source-view.cpa-log img {
-    max-width: 100%;
-    max-height: 100%; 
-    width: auto;
-    height: auto;
+    height: 100%;
     object-fit: contain;
     cursor: zoom-in;
-    transition: transform 0.1s; /* 아주 살짝 부드럽게 */
-    transform-origin: center center;
+    transition: transform 0.2s ease;
+
+    /* 중요: Obsidian 기본 스타일 덮어쓰기 */
+    display: block !important;
+    margin: 0 auto !important;
 }
 
-/* 7. 🔥 [핵심 변경] 컨테이너에 마우스를 올렸을 때 -> 자식 이미지를 변신시킴 */
-/* 기존: img:hover (이미지가 도망가면 호버 풀림) */
-/* 변경: .cpa-img-container:hover img (방에 마우스가 있으면 이미지는 계속 도망가있음) */
-.cpa-img-container:hover img {
-    position: fixed !important; 
+/* 🔥 [확대 상태] 클릭 시 적용됨 */
+.cpa-img-container img.cpa-expanded {
+    position: fixed !important;
     z-index: 999999 !important;
-    
-    /* 위치: 화면 왼쪽 고정 */
+
     top: 50% !important;
-    left: 1vw !important; 
-    transform: translateY(-50%) !important;
-    
-    /* 크기 제한 해제 */
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
+
+    /* 크기: 화면의 90%까지 */
     width: auto !important;
     height: auto !important;
-    max-width: 55vw !important; 
-    max-height: 98vh !important;
-    
-    /* 스타일 */
+    max-width: 95vw !important;
+    max-height: 95vh !important;
+
     background-color: var(--background-primary);
     border: 3px solid var(--interactive-accent);
     border-radius: 8px;
-    box-shadow: 10px 10px 100px rgba(0, 0, 0, 0.8);
-}
+    box-shadow: 0 0 0 100vw rgba(0, 0, 0, 0.7); /* 배경 어둡게 */
 
-/* 스크롤바 */
-.cpa-log div::-webkit-scrollbar { width: 8px; }
-.cpa-log div::-webkit-scrollbar-thumb { background-color: var(--scrollbar-thumb-bg); border-radius: 4px; }
+    cursor: zoom-out;
+}
