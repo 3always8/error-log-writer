@@ -1,54 +1,113 @@
-/* ... (위쪽 테이블 레이아웃은 기존 유지) ... */
-
-/* [글자 겹침 해결] 텍스트 렌더링 최적화 */
-.cpa-log, .cpa-solution, .cpa-text {
-    font-variant-ligatures: none !important; /* 글자 뭉침 방지 */
-    text-rendering: optimizeLegibility !important; /* 가독성 우선 */
-    letter-spacing: normal !important; /* 자간 초기화 */
-    font-kerning: normal !important;
-
-    /* 한글/영문 섞임 문제 완화 */
-    word-break: break-all;
-    white-space: pre-wrap;
+/* 1. 테이블 레이아웃 고정 */
+.cpa-log table {
+    table-layout: fixed !important;
+    width: 100% !important;
+    border-collapse: collapse;
 }
 
-/* 수식($) 주변 여백 확보 */
-.cpa-solution .MathJax, .cpa-solution .mjx-chtml {
-    margin: 0 2px !important;
+/* 2. 컬럼 너비 설정 (총 5개 컬럼) */
+/* 1열: 과목 */
+.cpa-log th:nth-child(1), .cpa-log td:nth-child(1) {
+    width: 10%;
+    text-align: center !important;
 }
 
-/* 이미지 평소 상태 (수정) */
-.cpa-img-container img {
+/* 2열: 문제 (이미지) */
+.cpa-log th:nth-child(2), .cpa-log td:nth-child(2) {
+    width: 43%;
+    padding: 0 !important; /* 이미지 꽉 채우기 위해 패딩 제거 */
+}
+
+/* 3열: 정답 */
+.cpa-log th:nth-child(3), .cpa-log td:nth-child(3) {
+    width: 7%;
+    text-align: center !important;
+    font-weight: bold;
+}
+
+/* 4열: 풀이 */
+.cpa-log th:nth-child(4), .cpa-log td:nth-child(4) {
+    width: 30%;
+}
+
+/* 5열: 비고 (빈칸) - 새로 추가됨 */
+.cpa-log th:nth-child(5), .cpa-log td:nth-child(5) {
+    width: 10%;
+    text-align: center !important;
+}
+
+/* 3. 이미지 컨테이너 (평소 상태) */
+.cpa-img-container {
+    height: 250px; /* 높이 고정 */
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background-color: var(--background-secondary);
+}
+
+/* 4. 이미지 스타일 (평소 상태) */
+/* 클릭 가능함을 보여주는 커서와 스타일 */
+.cpa-clickable-img {
     width: 100%;
     height: 100%;
-    object-fit: contain;
+    object-fit: contain; /* 비율 유지하며 꽉 채우기 */
     cursor: zoom-in;
     transition: transform 0.2s ease;
-
-    /* 중요: Obsidian 기본 스타일 덮어쓰기 */
     display: block !important;
     margin: 0 auto !important;
 }
 
-/* 🔥 [확대 상태] 클릭 시 적용됨 */
-.cpa-img-container img.cpa-expanded {
+/* 5. 풀이/텍스트 영역 스타일 */
+.cpa-solution {
+    max-height: 250px;
+    overflow-y: auto;  /* 세로 스크롤 허용 */
+    overflow-x: hidden;
+    padding-right: 5px;
+}
+
+/* 글자 겹침 방지 및 가독성 최적화 */
+.cpa-log, .cpa-solution, .cpa-text {
+    font-variant-ligatures: none !important;
+    text-rendering: optimizeLegibility !important;
+    letter-spacing: normal !important;
+    font-kerning: normal !important;
+    word-break: break-all;
+    white-space: pre-wrap; /* 줄바꿈 허용 */
+    line-height: 1.6;
+}
+
+/* 수식($) 주변 여백 */
+.cpa-solution .MathJax, .cpa-solution .mjx-chtml {
+    margin: 0 2px !important;
+}
+
+/* 1. 테이블 내 원본 이미지 (평소 상태) */
+.cpa-clickable-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    cursor: zoom-in;
+    display: block !important;
+    margin: 0 auto !important;
+    /* 원본은 그대로 둡니다. 건드리면 에디터가 놀라요. */
+}
+
+/* 2. 🔥 [새로 추가] 화면 위에 둥둥 떠다니는 복제본 이미지 */
+.cpa-floating-expanded {
     position: fixed !important;
-    z-index: 999999 !important;
-
+    z-index: 40 !important; /* 하이라이트 팝업(보통 100 이상)보다 낮게 설정 */
     top: 50% !important;
-    left: 50% !important;
-    transform: translate(-50%, -50%) !important;
-
-    /* 크기: 화면의 90%까지 */
+    left: 5px !important;
+    transform: translateY(-50%) !important;
     width: auto !important;
     height: auto !important;
-    max-width: 95vw !important;
-    max-height: 95vh !important;
-
+    max-width: 54vw !important;
+    max-height: 90vh !important;
     background-color: var(--background-primary);
-    border: 3px solid var(--interactive-accent);
+    border: 2px solid var(--interactive-accent);
     border-radius: 8px;
-    box-shadow: 0 0 0 100vw rgba(0, 0, 0, 0.7); /* 배경 어둡게 */
-
-    cursor: zoom-out;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    pointer-events: auto !important;
 }

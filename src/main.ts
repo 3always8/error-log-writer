@@ -30,7 +30,7 @@ const DEFAULT_MODELS: Record<string, string> = {
 
 // ... (인터페이스 기존 동일) ...
 interface UniversalFile { name: string; path: string; mtime: number; isExternal: boolean; extension: string; originalObject?: TFile; }
-interface ProblemItem { subject: string; question_number: string; answer: string; solution: string; imagePath: string; isExternal: boolean; }
+interface ProblemItem { subject: string; answer: string; solution: string; imagePath: string; isExternal: boolean; }
 
 // macOS 폴더 선택 함수
 function pickFolderMac(): Promise<string | null> {
@@ -47,12 +47,13 @@ export default class ErrorLogPlugin extends Plugin {
     settings: ErrorLogSettings;
     genAI: GoogleGenerativeAI;
 
-    async onload() {
+	async onload() {
         await this.loadSettings();
         if (this.settings.geminiApiKey) {
             this.genAI = new GoogleGenerativeAI(this.settings.geminiApiKey);
         }
 
+        // 리본 아이콘 (기존 유지)
         this.addRibbonIcon('brain-circuit', 'Create Error Log', (evt: MouseEvent) => {
             if (!this.settings.geminiApiKey) { new Notice('⚠️ API Key Required'); return; }
             new TargetFileSuggestModal(this.app, this, (selectedPath) => {
@@ -62,7 +63,94 @@ export default class ErrorLogPlugin extends Plugin {
             }).open();
         });
 
+        // 🔥 [완전 해결] 에디터 동작을 방해하지 않는 정밀한 이벤트 제어
+        this.registerDomEvent(document, 'mouseover', (evt: MouseEvent) => {
+            const target = evt.target as HTMLElement;
+
+            // 1. 이미지가 아닌 곳에 마우스가 있으면 아무것도 하지 않음 (에디터에 전권 위임)
+            if (!target.classList.contains('cpa-clickable-img')) return;
+
+            // 2. Alt 키가 눌려있을 때만 확대 실행
+            if (evt.altKey) {
+                const src = (target as HTMLImageElement).src;
+                const existingOverlay = document.getElementById('cpa-floating-overlay');
+
+                if (existingOverlay && (existingOverlay as HTMLImageElement).src === src) return;
+                if (existingOverlay) existingOverlay.remove();
+
+                const overlayImg = document.createElement('img');
+                overlayImg.src = src;
+                overlayImg.id = 'cpa-floating-overlay';
+                overlayImg.className = 'cpa-floating-expanded';
+
+                overlayImg.onclick = (e) => {
+                    overlayImg.remove();
+                    e.stopPropagation();
+                };
+
+                document.body.appendChild(overlayImg);
+
+                // 이미지 위에서의 이벤트만 차단하여 에디터 포커스 튐 방지
+                evt.stopImmediatePropagation();
+            }
+        });
+
+        // ESC 키 닫기 (기존 유지)
+        this.registerDomEvent(document, 'keydown', (evt: KeyboardEvent) => {
+            if (evt.key === 'Escape') {
+                const overlay = document.getElementById('cpa-floating-overlay');
+                if (overlay) overlay.remove();
+            }
+        });
+
         this.addSettingTab(new ErrorLogSettingTab(this.app, this));
+    }
+	// 🔥 [필수] 플러그인 꺼질 때 리스너 제거 (안 하면 메모리 누수 & 중복 실행됨)
+    onunload() {
+        window.removeEventListener('click', this.handleImageClick, true);
+    }
+
+    // 🖱️ Mousedown 핸들러 (편집 모드 진입 방지)
+    handleImageMousedown(evt: MouseEvent) {
+        const target = evt.target as HTMLElement;
+        if (target.tagName === 'IMG' && target.classList.contains('cpa-clickable-img')) {
+            // "편집기야, 여기 클릭한 거 무시해!"
+            evt.preventDefault();
+            evt.stopPropagation();
+            evt.stopImmediatePropagation();
+        }
+    }
+
+    // 🖱️ Click 핸들러 (확대/축소 로직)
+    handleImageClick(evt: MouseEvent) {
+        const target = evt.target as HTMLElement;
+
+        // 1. 이미지 클릭 시
+        if (target.tagName === 'IMG' && target.classList.contains('cpa-clickable-img')) {
+            // 확대/축소 토글
+            if (target.classList.contains('cpa-expanded')) {
+                target.classList.remove('cpa-expanded');
+            } else {
+                // 다른 열려있는 이미지 닫기
+                document.querySelectorAll('.cpa-clickable-img.cpa-expanded').forEach(img => {
+                    img.classList.remove('cpa-expanded');
+                });
+                target.classList.add('cpa-expanded');
+            }
+
+            // 이벤트 전파 중단 (부모 요소가 클릭 감지 못하게)
+            evt.preventDefault();
+            evt.stopPropagation();
+            evt.stopImmediatePropagation();
+        }
+        // 2. 배경(이미지 밖) 클릭 시 닫기 (이미지 클릭은 위에서 멈췄으므로 여기 안 옴)
+        else {
+            // (주의: 여기서 stopPropagation 하면 안 됨. 다른 UI 클릭이 먹통 됨)
+            const expandedImgs = document.querySelectorAll('.cpa-clickable-img.cpa-expanded');
+            if (expandedImgs.length > 0) {
+                expandedImgs.forEach(img => img.classList.remove('cpa-expanded'));
+            }
+        }
     }
 
     openImageSelector(targetPath: string) {
@@ -119,7 +207,7 @@ export default class ErrorLogPlugin extends Plugin {
         }
 	}
 
-    async processFile(file: UniversalFile): Promise<ProblemItem[] | null> {
+	async processFile(file: UniversalFile): Promise<ProblemItem[] | null> {
         try {
             let base64Data = "";
             if (file.isExternal) {
@@ -143,22 +231,26 @@ export default class ErrorLogPlugin extends Plugin {
             try {
                 problems = this.parseRoughJson(result.response.text());
             } catch (e) {
-                console.error(e);
-                return [{ subject: "Error", question_number: "Err", answer: "Check Log", solution: `JSON 파싱 실패.\n${result.response.text()}`.replace(/\|/g, '/'), imagePath: file.path, isExternal: file.isExternal }];
+                // 🔥 [수정] 파싱 실패 시 에러 로그만 찍고 null 반환 (목록에서 제외됨)
+                console.error(`JSON 파싱 실패 (${file.name}):`, e);
+                new Notice(`⚠️ 분석 실패 (형식 오류): ${file.name}`);
+                return null;
             }
 
             if (Array.isArray(problems)) {
                 return problems.map(p => ({ ...p, imagePath: file.path, isExternal: file.isExternal }));
             }
             return null;
+
         } catch (error) {
-            console.error(error);
-            new Notice(`실패 (${file.name}): ${(error as Error).message}`);
+            // API 호출 자체 실패 시
+            console.error(`API 호출 실패 (${file.name}):`, error);
+            new Notice(`❌ API 오류: ${file.name}`);
             return null;
         }
     }
 
-    // 💾 마크다운 저장 (🔥 이미지 깨짐 완벽 해결 버전)
+	// 💾 마크다운 저장 (🔥 이미지 깨짐 완벽 해결 버전)
     async saveToMarkdown(items: ProblemItem[], targetPath: string) {
         const { vault } = this.app;
         if (!targetPath || targetPath.trim() === "") targetPath = "CPA_Error_Log.md";
@@ -221,7 +313,16 @@ export default class ErrorLogPlugin extends Plugin {
                     // D. 🔥 [중요] 생성된 TFile 객체로부터 직접 Resource Path 추출
                     // 이 방식이 가장 확실하게 이미지를 띄워줍니다.
                     resourcePath = vault.getResourcePath(createdFile);
-
+					if (item.isExternal) {
+                        try {
+                            // fs.unlinkSync: 파일을 영구 삭제하는 Node.js 명령어
+                            fs.unlinkSync(item.imagePath);
+                            console.log(`원본 삭제 완료: ${item.imagePath}`);
+                        } catch (delErr) {
+                            console.error(`원본 삭제 실패 (권한 또는 잠금 문제): ${item.imagePath}`, delErr);
+                            new Notice(`⚠️ 이미지는 저장됐지만 원본 삭제 실패: ${originalName}`);
+                        }
+                    }
                     // 디버깅용 (혹시 또 안 나오면 Console 확인)
                     console.log(`이미지 저장 성공: ${newInternalPath} -> ${resourcePath}`);
 
@@ -231,14 +332,14 @@ export default class ErrorLogPlugin extends Plugin {
                     resourcePath = "";
                     imgTag = `❌ 이미지 로드 실패`;
                 }
-
-                if (resourcePath) {
-                    // 클릭 이벤트 포함된 태그
-                    imgTag = `<div class="cpa-img-container"><img src="${resourcePath}" onclick="this.classList.toggle('cpa-expanded'); event.stopPropagation();"></div>`;
+				if (resourcePath) {
+                    imgTag = `<div class="cpa-img-container"><img src="${resourcePath}" class="cpa-clickable-img"></div>`;
+                } else {
+                    imgTag = `❌ 이미지 로드 실패`;
                 }
             }
 
-            chunk += `| ${safeSubject} | ${imgTag} | ${item.question_number} | ${safeAnswer} | ${scrollableSolution} |\n`;
+            chunk += `| ${safeSubject} | ${imgTag} | ${safeAnswer} | ${scrollableSolution} |  |\n`;
         }
 
         if (!fileExists) {
@@ -246,8 +347,8 @@ export default class ErrorLogPlugin extends Plugin {
 cssclasses: cpa-log
 ---
 
-| 과목 | 문제 | 번호 | 정답 | 풀이 |
-|:---:|:---|:---:|:---:|:---|
+| 과목 | 문제 | 정답 | 풀이 | 비고 |
+|:---:|:---|:---|:---|:---|
 `;
             await vault.create(targetPath, header + chunk);
             new Notice(`새 파일 생성됨: ${targetPath}`);
@@ -273,13 +374,15 @@ cssclasses: cpa-log
         catch (e) { clean = clean.replace(/,\s*}/g, '}'); return JSON.parse(clean); }
     }
 
+	// 🧹 데이터 정제 함수 (MathJax 납치 방지 버전)
     sanitizeForTable(text: string): string {
         if (!text) return "";
         let clean = text;
         clean = clean.replace(/^```(json|markdown|text)?/i, '').replace(/```$/i, '');
         clean = clean.replace(/^`/, '').replace(/`$/, '');
         clean = clean.replace(/\|/g, '&#124;');
-        clean = clean.replace(/\$([0-9])/g, '\\$$1');
+        clean = clean.replace(/\$([0-9,.]+)\$/g, '&#36;$1');
+        clean = clean.replace(/\$/g, '&#36;');
         clean = clean.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\\n/g, '<br>');
         return clean.trim();
     }

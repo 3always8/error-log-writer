@@ -19,7 +19,6 @@ export const CPA_GRADER_PROMPT = `
 [
   {
     "subject": "과목명 > 단원명 (예: 재무회계 > 재고자산)",
-    "question_number": "문제 번호",
     "solution": "상세 풀이 및 오답 분석 (줄바꿈은 <br> 사용)",
     "answer": "네가 도출한 진짜 정답 (예: A. $700) (<b>태그 강조)"
   }
