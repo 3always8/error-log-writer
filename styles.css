@@ -61,10 +61,10 @@
 
 /* 5. 풀이/텍스트 영역 스타일 */
 .cpa-solution {
-    max-height: 250px;
-    overflow-y: auto;  /* 세로 스크롤 허용 */
-    overflow-x: hidden;
+    max-height: none !important; /* 높이 제한 완전 해제 */
+    overflow: visible !important; /* 내부 스크롤바 제거 */
     padding-right: 5px;
+    height: 100%; /* 이미지가 늘린 행의 높이나 텍스트 자체 높이에 맞춰 자연스럽게 확장 */
 }
 
 /* 글자 겹침 방지 및 가독성 최적화 */
@@ -94,20 +94,37 @@
     /* 원본은 그대로 둡니다. 건드리면 에디터가 놀라요. */
 }
 
-/* 2. 🔥 [새로 추가] 화면 위에 둥둥 떠다니는 복제본 이미지 */
-.cpa-floating-expanded {
+/* 1. 스크롤 가능한 외부 컨테이너 (위치 및 크기 제한 담당) */
+#cpa-floating-container {
     position: fixed !important;
-    z-index: 40 !important; /* 하이라이트 팝업(보통 100 이상)보다 낮게 설정 */
+    z-index: 40 !important;
     top: 50% !important;
-    left: 5px !important;
+    left: 1vw !important; /* 왼쪽 여백 */
     transform: translateY(-50%) !important;
-    width: auto !important;
-    height: auto !important;
-    max-width: 54vw !important;
-    max-height: 90vh !important;
+
+    width: 54vw !important; /* 너비 고정 */
+    max-height: 96vh !important; /* 최대 높이 제한 */
+
+    overflow-y: auto !important; /* 세로 내용이 넘치면 스크롤바 생성 */
+    overflow-x: hidden !important; /* 가로 스크롤 방지 */
+
     background-color: var(--background-primary);
     border: 2px solid var(--interactive-accent);
     border-radius: 8px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
     pointer-events: auto !important;
+    cursor: zoom-out; /* 클릭하면 닫힌다는 표시 */
+
+    /* 스크롤바 디자인 (선택사항 - 크롬/엣지 기반) */
+    &::-webkit-scrollbar { width: 8px; }
+    &::-webkit-scrollbar-thumb { background-color: var(--interactive-accent); border-radius: 4px; }
+    &::-webkit-scrollbar-track { background-color: transparent; }
+}
+
+/* 2. 컨테이너 내부의 실제 이미지 (비율 유지하며 꽉 채우기 담당) */
+.cpa-floating-img-inside {
+    width: 100% !important; /* 컨테이너 너비에 맞춰 무조건 꽉 채움 */
+    height: auto !important; /* 비율에 맞춰 높이가 자동으로 늘어남 */
+    display: block !important; /* 이미지 하단 공백 제거 */
+    object-fit: contain !important; /* 안전장치 */
 }

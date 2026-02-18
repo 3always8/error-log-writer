@@ -1,59 +1,26 @@
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFile, Modal, SuggestModal, ButtonComponent } from 'obsidian';
+import { App, Plugin, Notice, TFile } from 'obsidian';
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { CPA_GRADER_PROMPT } from './prompts';
 import * as fs from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
-
-// ⚙️ 설정 인터페이스
-interface ErrorLogSettings {
-    geminiApiKey: string;
-    lastUsedPath: string;
-    modelName: string;
-    imageSourcePath: string;
-    attachmentsPath: string; // 🔥 [New] 첨부파일 저장 경로
-}
-
-const DEFAULT_SETTINGS: ErrorLogSettings = {
-    geminiApiKey: '',
-    lastUsedPath: 'CPA_Error_Log.md',
-    modelName: 'gemini-2.0-flash',
-    imageSourcePath: '',
-    attachmentsPath: 'CPA_Attachments' // 🔥 기본값: CPA_Attachments 폴더
-}
-
-const DEFAULT_MODELS: Record<string, string> = {
-    'gemini-2.0-flash': 'Gemini 2.0 Flash',
-    'gemini-1.5-flash': 'Gemini 1.5 Flash',
-    'gemini-1.5-pro': 'Gemini 1.5 Pro'
-};
-
-// ... (인터페이스 기존 동일) ...
-interface UniversalFile { name: string; path: string; mtime: number; isExternal: boolean; extension: string; originalObject?: TFile; }
-interface ProblemItem { subject: string; answer: string; solution: string; imagePath: string; isExternal: boolean; }
-
-// macOS 폴더 선택 함수
-function pickFolderMac(): Promise<string | null> {
-    return new Promise((resolve) => {
-        const script = `osascript -e 'POSIX path of (choose folder with prompt "Select Folder containing images")'`;
-        exec(script, (error, stdout, stderr) => {
-            if (error) { resolve(null); return; }
-            resolve(stdout ? stdout.trim() : null);
-        });
-    });
-}
+import * as pdfjsLib from 'pdfjs-dist';
+import 'pdfjs-dist/build/pdf.worker.mjs';
+// 리팩토링된 모듈 불러오기
+import { ErrorLogSettings, DEFAULT_SETTINGS, UniversalFile, ProblemItem } from './types';
+import { CPA_GRADER_BATCH_PROMPT } from './prompts';
+import { TargetFileSuggestModal, MultiSelectModal } from './modals';
+import { ErrorLogSettingTab } from './settings';
 
 export default class ErrorLogPlugin extends Plugin {
     settings: ErrorLogSettings;
     genAI: GoogleGenerativeAI;
 
-	async onload() {
+    async onload() {
         await this.loadSettings();
         if (this.settings.geminiApiKey) {
             this.genAI = new GoogleGenerativeAI(this.settings.geminiApiKey);
         }
 
-        // 리본 아이콘 (기존 유지)
+        // 리본 아이콘
         this.addRibbonIcon('brain-circuit', 'Create Error Log', (evt: MouseEvent) => {
             if (!this.settings.geminiApiKey) { new Notice('⚠️ API Key Required'); return; }
             new TargetFileSuggestModal(this.app, this, (selectedPath) => {
@@ -63,94 +30,55 @@ export default class ErrorLogPlugin extends Plugin {
             }).open();
         });
 
-        // 🔥 [완전 해결] 에디터 동작을 방해하지 않는 정밀한 이벤트 제어
+        // 🖱️ 이미지 호버 & Alt 키 이벤트 (동기화 대응 및 스크롤 컨테이너 적용)
         this.registerDomEvent(document, 'mouseover', (evt: MouseEvent) => {
             const target = evt.target as HTMLElement;
+            if (target.tagName !== 'IMG') return;
 
-            // 1. 이미지가 아닌 곳에 마우스가 있으면 아무것도 하지 않음 (에디터에 전권 위임)
-            if (!target.classList.contains('cpa-clickable-img')) return;
+            const imgTarget = target as HTMLImageElement;
+            const attachmentsFolder = this.settings.attachmentsPath || "CPA_Attachments";
 
-            // 2. Alt 키가 눌려있을 때만 확대 실행
+            const isTargetImage = imgTarget.src.includes(attachmentsFolder) ||
+                                  (imgTarget.getAttribute('data-path') && imgTarget.getAttribute('data-path')!.includes(attachmentsFolder));
+
+            if (!isTargetImage) return;
+
             if (evt.altKey) {
-                const src = (target as HTMLImageElement).src;
-                const existingOverlay = document.getElementById('cpa-floating-overlay');
+                const src = imgTarget.src;
+                // 기존에 떠있는 컨테이너가 있으면 제거
+                const existingContainer = document.getElementById('cpa-floating-container');
+                if (existingContainer) existingContainer.remove();
 
-                if (existingOverlay && (existingOverlay as HTMLImageElement).src === src) return;
-                if (existingOverlay) existingOverlay.remove();
+                // 1. 스크롤 가능한 컨테이너 생성 (Wrapper)
+                const container = document.createElement('div');
+                container.id = 'cpa-floating-container'; // ID 변경됨
 
+                // 2. 실제 이미지 생성 및 컨테이너에 삽입
                 const overlayImg = document.createElement('img');
                 overlayImg.src = src;
-                overlayImg.id = 'cpa-floating-overlay';
-                overlayImg.className = 'cpa-floating-expanded';
+                overlayImg.className = 'cpa-floating-img-inside'; // 내부 이미지용 클래스
+                container.appendChild(overlayImg);
 
-                overlayImg.onclick = (e) => {
-                    overlayImg.remove();
+                // 3. 컨테이너 클릭 시 닫기
+                container.onclick = (e) => {
+                    container.remove();
                     e.stopPropagation();
                 };
 
-                document.body.appendChild(overlayImg);
-
-                // 이미지 위에서의 이벤트만 차단하여 에디터 포커스 튐 방지
+                document.body.appendChild(container);
                 evt.stopImmediatePropagation();
             }
         });
 
-        // ESC 키 닫기 (기존 유지)
+        // ESC 키 닫기 (ID 변경 반영)
         this.registerDomEvent(document, 'keydown', (evt: KeyboardEvent) => {
             if (evt.key === 'Escape') {
-                const overlay = document.getElementById('cpa-floating-overlay');
-                if (overlay) overlay.remove();
+                const container = document.getElementById('cpa-floating-container');
+                if (container) container.remove();
             }
         });
 
         this.addSettingTab(new ErrorLogSettingTab(this.app, this));
-    }
-	// 🔥 [필수] 플러그인 꺼질 때 리스너 제거 (안 하면 메모리 누수 & 중복 실행됨)
-    onunload() {
-        window.removeEventListener('click', this.handleImageClick, true);
-    }
-
-    // 🖱️ Mousedown 핸들러 (편집 모드 진입 방지)
-    handleImageMousedown(evt: MouseEvent) {
-        const target = evt.target as HTMLElement;
-        if (target.tagName === 'IMG' && target.classList.contains('cpa-clickable-img')) {
-            // "편집기야, 여기 클릭한 거 무시해!"
-            evt.preventDefault();
-            evt.stopPropagation();
-            evt.stopImmediatePropagation();
-        }
-    }
-
-    // 🖱️ Click 핸들러 (확대/축소 로직)
-    handleImageClick(evt: MouseEvent) {
-        const target = evt.target as HTMLElement;
-
-        // 1. 이미지 클릭 시
-        if (target.tagName === 'IMG' && target.classList.contains('cpa-clickable-img')) {
-            // 확대/축소 토글
-            if (target.classList.contains('cpa-expanded')) {
-                target.classList.remove('cpa-expanded');
-            } else {
-                // 다른 열려있는 이미지 닫기
-                document.querySelectorAll('.cpa-clickable-img.cpa-expanded').forEach(img => {
-                    img.classList.remove('cpa-expanded');
-                });
-                target.classList.add('cpa-expanded');
-            }
-
-            // 이벤트 전파 중단 (부모 요소가 클릭 감지 못하게)
-            evt.preventDefault();
-            evt.stopPropagation();
-            evt.stopImmediatePropagation();
-        }
-        // 2. 배경(이미지 밖) 클릭 시 닫기 (이미지 클릭은 위에서 멈췄으므로 여기 안 옴)
-        else {
-            // (주의: 여기서 stopPropagation 하면 안 됨. 다른 UI 클릭이 먹통 됨)
-            const expandedImgs = document.querySelectorAll('.cpa-clickable-img.cpa-expanded');
-            if (expandedImgs.length > 0) {
-                expandedImgs.forEach(img => img.classList.remove('cpa-expanded'));
-            }
-        }
     }
 
     openImageSelector(targetPath: string) {
@@ -164,107 +92,294 @@ export default class ErrorLogPlugin extends Plugin {
         ).open();
     }
 
+    // 🚀 일괄 처리 로직 (PDF 분해 + Chunk 단위 LLM 전송)
     async batchProcessImages(files: UniversalFile[], targetPath: string) {
         if (files.length === 0) return;
-        new Notice(`총 ${files.length}개의 파일 분석 시작! 🏃`);
-        let allProblems: ProblemItem[] = [];
 
-        for (const [i, file] of files.entries()) {
-            if (!file) continue;
-            new Notice(`[${i + 1}/${files.length}] AI 분석 중: ${file.name}`);
-            const problems = await this.processFile(file);
-            if (problems && problems.length > 0) allProblems.push(...problems);
-            if (i < files.length - 1) await new Promise(resolve => setTimeout(resolve, 2000));
+        let assetsFolder = this.settings.attachmentsPath || "CPA_Attachments";
+        if (!(await this.app.vault.adapter.exists(assetsFolder))) {
+            await this.app.vault.createFolder(assetsFolder);
         }
 
-		if (allProblems.length > 0) {
+        // 1. PDF를 이미지로 쪼개서 목록(Flat) 만들기
+        let processableFiles: UniversalFile[] = [];
+        for (const file of files) {
+            if (file.extension.toLowerCase() === 'pdf') {
+                const splitImages = await this.convertPdfToImages(file, assetsFolder);
+                processableFiles.push(...splitImages);
+            } else {
+                processableFiles.push(file);
+            }
+        }
+
+        if (processableFiles.length === 0) return;
+
+        let allProblems: ProblemItem[] = [];
+        const CHUNK_SIZE = 5; // 한 번에 API에 전송할 이미지 수
+        const totalChunks = Math.ceil(processableFiles.length / CHUNK_SIZE);
+
+        new Notice(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
+
+        // 2. Chunk 단위로 묶어서 LLM 통신
+        for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+            const start = chunkIdx * CHUNK_SIZE;
+            const end = start + CHUNK_SIZE;
+            const chunkFiles = processableFiles.slice(start, end);
+
+            new Notice(`[묶음 ${chunkIdx + 1}/${totalChunks}] AI 분석 중... (${chunkFiles.length}장 처리)`);
+
+            const problems = await this.fetchProblemsFromLLM(chunkFiles); // 🔥 이름 변경됨
+            if (problems && problems.length > 0) {
+                allProblems.push(...problems);
+            }
+
+            if (chunkIdx < totalChunks - 1) await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+
+        // 3. 분석 결과 파일에 저장
+        if (allProblems.length > 0) {
             new Notice(`분석 완료! 저장 중... 📝`);
             await this.saveToMarkdown(allProblems, targetPath);
-            new Notice("🎉 모든 오답노트 작성이 완료되었습니다!");
+            new Notice("🎉 오답노트 작성이 완료되었습니다!");
 
-            // 🔥 [추가됨] 파일 자동 열기/포커스 기능
             const file = this.app.vault.getAbstractFileByPath(targetPath);
             if (file instanceof TFile) {
-                // 1. 현재 열려있는 모든 마크다운 탭 조회
                 const leaves = this.app.workspace.getLeavesOfType('markdown');
-
-                // 2. 해당 파일을 보고 있는 탭이 있는지 찾기
                 const existingLeaf = leaves.find(leaf => {
-                    const view = leaf.view as any; // 타입 단언으로 file 접근
+                    const view = leaf.view as any;
                     return view.file && view.file.path === file.path;
                 });
-
-                if (existingLeaf) {
-                    // A. 이미 열려있다면 -> 그 탭을 활성화(Focus)
-                    this.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
-                } else {
-                    // B. 안 열려있다면 -> 새 탭('tab')을 만들어서 열기
-                    await this.app.workspace.getLeaf('tab').openFile(file);
-                }
+                if (existingLeaf) this.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
+                else await this.app.workspace.getLeaf('tab').openFile(file);
             }
         } else {
             new Notice("⚠️ 추출된 문제가 없습니다.");
         }
-	}
+    }
 
-	async processFile(file: UniversalFile): Promise<ProblemItem[] | null> {
+    // 📦 묶음 단위(Batch)로 LLM에 전송하고 결과를 매핑하는 함수
+    async fetchProblemsFromLLM(files: UniversalFile[]): Promise<ProblemItem[] | null> {
+        await this.writeDebugLog("LLM_BATCH_START", `Batch 요청 시작. 처리할 파일 수: ${files.length}`);
+
         try {
-            let base64Data = "";
-            if (file.isExternal) {
-                const bitmap = fs.readFileSync(file.path);
-                base64Data = Buffer.from(bitmap).toString('base64');
-            } else if (file.originalObject) {
-                const arrayBuffer = await this.app.vault.readBinary(file.originalObject);
-                base64Data = Buffer.from(arrayBuffer).toString('base64');
-            }
-
-            const mimeType = file.extension === 'pdf' ? 'application/pdf' : 'image/png';
             const modelName = this.settings?.modelName || "gemini-2.0-flash";
             const model = this.genAI.getGenerativeModel({ model: modelName });
 
-            const result = await model.generateContent([
-                CPA_GRADER_PROMPT,
-                { inlineData: { data: base64Data, mimeType: mimeType } }
-            ]);
+            const promptParts: any[] = [CPA_GRADER_BATCH_PROMPT];
 
-            let problems: any[] = [];
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+
+                // 🔥 [수정 1] file 객체가 null 또는 undefined인 경우 방어 (에러 방지)
+                if (!file || !file.path) {
+                    await this.writeDebugLog("BATCH_WARNING", `인덱스 ${i}의 파일 객체가 비어있습니다. 건너뜁니다.`);
+                    continue;
+                }
+
+                let base64Data = "";
+
+                if (file.isExternal) {
+                    const bitmap = fs.readFileSync(file.path);
+                    base64Data = Buffer.from(bitmap).toString('base64');
+                } else if (file.originalObject) {
+                    const arrayBuffer = await this.app.vault.readBinary(file.originalObject as TFile);
+                    base64Data = Buffer.from(arrayBuffer).toString('base64');
+                }
+
+                const mimeType = 'image/png';
+
+                promptParts.push({ text: `\n--- [Image Index: ${i}] ---\n` });
+                promptParts.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+            }
+
+            const result = await model.generateContent(promptParts);
+            const textResponse = result.response.text();
+
+            await this.writeDebugLog("LLM_RESPONSE_RAW", `LLM 원문 응답 수신 완료`, textResponse);
+
+            let extractedData: any[] = [];
             try {
-                problems = this.parseRoughJson(result.response.text());
+                extractedData = this.parseRoughJson(textResponse);
             } catch (e) {
-                // 🔥 [수정] 파싱 실패 시 에러 로그만 찍고 null 반환 (목록에서 제외됨)
-                console.error(`JSON 파싱 실패 (${file.name}):`, e);
-                new Notice(`⚠️ 분석 실패 (형식 오류): ${file.name}`);
+                await this.writeDebugLog("JSON_PARSE_ERROR", `JSON 파싱 실패`, e);
+                new Notice(`⚠️ 묶음 분석 실패 (형식 오류)`);
                 return null;
             }
 
-            if (Array.isArray(problems)) {
-                return problems.map(p => ({ ...p, imagePath: file.path, isExternal: file.isExternal }));
+            if (!Array.isArray(extractedData)) {
+                await this.writeDebugLog("JSON_FORMAT_ERROR", `결과가 배열 형식이 아님`, extractedData);
+                return null;
             }
-            return null;
+
+            const mappedProblems: ProblemItem[] = [];
+            for (const item of extractedData) {
+                const idx = item.image_index;
+                if (typeof idx === 'number' && idx >= 0 && idx < files.length) {
+                    const matchedFile = files[idx];
+
+                    // 🔥 [수정 2] 매핑할 원본 파일 객체가 null인 경우 방어
+                    if (!matchedFile) {
+                        await this.writeDebugLog("MAPPING_WARNING", `인덱스 ${idx}에 매핑할 원본 파일이 존재하지 않습니다.`, item);
+                        continue;
+                    }
+
+                    mappedProblems.push({
+                        ...item,
+                        imagePath: matchedFile.path,
+                        isExternal: matchedFile.isExternal
+                    });
+                } else {
+                    await this.writeDebugLog("MAPPING_WARNING", `유효하지 않은 image_index: ${idx}`, item);
+                }
+            }
+
+            mappedProblems.sort((a, b) => {
+                const idxA = a.image_index !== undefined ? a.image_index : 0;
+                const idxB = b.image_index !== undefined ? b.image_index : 0;
+                return idxA - idxB;
+            });
+
+            await this.writeDebugLog("BATCH_SUCCESS", `추출 및 매핑된 문제 수: ${mappedProblems.length}`);
+            return mappedProblems;
 
         } catch (error) {
-            // API 호출 자체 실패 시
-            console.error(`API 호출 실패 (${file.name}):`, error);
-            new Notice(`❌ API 오류: ${file.name}`);
+            await this.writeDebugLog("LLM_API_ERROR", `Batch API 호출 실패`, error);
+            console.error(`Batch API 호출 실패:`, error);
             return null;
         }
     }
 
-	// 💾 마크다운 저장 (🔥 이미지 깨짐 완벽 해결 버전)
+    async convertPdfToImages(pdfFile: UniversalFile, targetFolder: string): Promise<UniversalFile[]> {
+        await this.writeDebugLog("PDF_CONVERT_START", `정밀 렌더링 엔진 가동: ${pdfFile.name}`);
+        const { vault } = this.app;
+        const generatedImages: UniversalFile[] = [];
+
+        try {
+            let data: ArrayBuffer;
+            if (pdfFile.isExternal) {
+                data = fs.readFileSync(pdfFile.path).buffer;
+            } else {
+                data = await vault.readBinary(pdfFile.originalObject as TFile);
+            }
+
+            // 🔥 [해결 1] 라이브러리 버전을 동적으로 확인하여 워커 주소 일치시킴
+            if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+                pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+            }
+
+            // const loadingTask = pdfjsLib.getDocument({
+            //     data: new Uint8Array(data),
+            //     // 워커 로드 실패 시 메인 스레드에서라도 실행하도록 함 (약간 느려질 수 있으나 작동은 함)
+            //     disableWorker: false,
+            //     stopAtErrors: false
+            // });
+
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(data),
+                // 폰트 로딩 문제 방지
+                disableFontFace: false
+            });
+
+            const pdfDocument = await loadingTask.promise;
+            const numPages = pdfDocument.numPages;
+
+            for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                const page = await pdfDocument.getPage(pageNum);
+
+                // 🔥 [해결 2] 스케일을 1.2로 약간 낮춰 메모리 압박 감소 (CPA 시험지는 1.2로도 충분합니다)
+                const viewport = page.getViewport({ scale: 1.2 });
+
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d', { alpha: false }); // 성능 향상을 위해 알파 채널 제거
+
+                if (!context) throw new Error("Canvas Context 생성 실패");
+
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                // 🔥 [해결 3] 렌더링 태스크에 명시적인 에러 캐칭 추가
+                const renderContext = {
+                    canvasContext: context,
+                    viewport: viewport,
+                    canvas: canvas
+                };
+
+                const renderTask = page.render(renderContext);
+
+                try {
+                    await renderTask.promise;
+                } catch (renderErr) {
+                    await this.writeDebugLog("RENDER_TASK_ERROR", `페이지 ${pageNum} 렌더링 실패`, renderErr);
+                    continue; // 한 페이지 실패해도 다음 페이지 시도
+                }
+
+                const dataUrl = canvas.toDataURL('image/png');
+                const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
+                const buffer = Buffer.from(base64Data, 'base64');
+
+                const originalName = path.basename(pdfFile.path, '.pdf').replace(/[^a-zA-Z0-9가-힣]/g, '_');
+                const newFileName = `${Date.now()}_${originalName}_p${pageNum}.png`;
+                const newInternalPath = `${targetFolder}/${newFileName}`;
+
+                const createdFile = await vault.createBinary(newInternalPath, buffer);
+
+                generatedImages.push({
+                    name: createdFile.name,
+                    path: createdFile.path,
+                    mtime: createdFile.stat.mtime,
+                    isExternal: false,
+                    extension: 'png',
+                    originalObject: createdFile
+                });
+
+                // 메모리 해제 지원
+                canvas.width = 0;
+                canvas.height = 0;
+            }
+
+            await this.writeDebugLog("PDF_CONVERT_SUCCESS", `성공적으로 ${generatedImages.length}개 이미지 생성`);
+            return generatedImages;
+
+        } catch (error) {
+            await this.writeDebugLog("PDF_CONVERT_FATAL", `PDF 처리 파이프라인 붕괴`, error);
+            new Notice(`❌ PDF 변환 실패: ${pdfFile.name}`);
+            return [];
+        }
+    }
+
+    // 📝 디버그 로깅
+    async writeDebugLog(context: string, message: string, data: any = "") {
+        const { vault } = this.app;
+        const logPath = this.settings.debugLogPath || "CPA_Debug_Log.md";
+        const timestamp = window.moment().format("YYYY-MM-DD HH:mm:ss");
+
+        let dataString = "";
+        if (data instanceof Error) dataString = `${data.name}: ${data.message}\n${data.stack || ''}`;
+        else if (typeof data === 'object') { try { dataString = JSON.stringify(data, null, 2); } catch (e) { dataString = String(data); } }
+        else dataString = String(data);
+
+        const logEntry = `\n### [${timestamp}] ${context}\n- **Message**: ${message}\n- **Data**:\n\`\`\`text\n${dataString}\n\`\`\`\n`;
+
+        try {
+            const fileExists = await vault.adapter.exists(logPath);
+            if (!fileExists) await vault.create(logPath, `# 🐞 CPA Plugin Debug Log\n${logEntry}`);
+            else {
+                const file = vault.getAbstractFileByPath(logPath);
+                if (file instanceof TFile) await vault.process(file, (content) => content + logEntry);
+            }
+            console.log(`[CPA Debug: ${context}]`, message);
+        } catch (e) { console.error("로그 작성 실패:", e); }
+    }
+
+    // 💾 마크다운 저장 (위키링크 버전)
     async saveToMarkdown(items: ProblemItem[], targetPath: string) {
         const { vault } = this.app;
         if (!targetPath || targetPath.trim() === "") targetPath = "CPA_Error_Log.md";
         if (!targetPath.endsWith(".md")) targetPath += ".md";
 
         const fileExists = await vault.adapter.exists(targetPath);
-
-        // 1. 첨부파일 폴더 준비
-        let assetsFolder = this.settings.attachmentsPath;
-        if (!assetsFolder || assetsFolder.trim() === "") assetsFolder = "CPA_Attachments";
-
-        if (!(await vault.adapter.exists(assetsFolder))) {
-            await vault.createFolder(assetsFolder);
-        }
+        let assetsFolder = this.settings.attachmentsPath || "CPA_Attachments";
+        if (!(await vault.adapter.exists(assetsFolder))) await vault.createFolder(assetsFolder);
 
         let chunk = "";
         let currentPath: string | null = null;
@@ -273,96 +388,48 @@ export default class ErrorLogPlugin extends Plugin {
             const safeSubject = this.sanitizeForTable(item.subject || "기타");
             const safeAnswer = this.sanitizeForTable(item.answer || "");
             const safeSolution = this.sanitizeForTable(item.solution || "");
+            const safeNumber = this.sanitizeForTable(item.number || "");
             const scrollableSolution = `<div class="cpa-solution cpa-text">${safeSolution}</div>`;
 
             const showImage = (item.imagePath !== currentPath);
             currentPath = item.imagePath;
-            let createdFile: TFile | null = null;
 
             let imgTag = "";
             if (showImage) {
-                let resourcePath = "";
-
                 try {
-                    // 🔥 [핵심] 외부 파일이든 내부 파일이든, 안전하게 '첨부 폴더'로 복사 후 사용
-                    // (원본이 삭제되거나 이동되어도 오답노트는 유지되도록 함)
-
-                    // A. 원본 데이터 읽기
                     let data: Buffer;
-                    if (item.isExternal) {
-                        data = fs.readFileSync(item.imagePath);
-                    } else {
-                        // 내부 파일인 경우
+                    if (item.isExternal) data = fs.readFileSync(item.imagePath);
+                    else {
                         const fileObj = vault.getAbstractFileByPath(item.imagePath);
-                        if (fileObj instanceof TFile) {
-                            const arrBuf = await vault.readBinary(fileObj);
-                            data = Buffer.from(arrBuf);
-                        } else {
-                            throw new Error("내부 파일을 찾을 수 없음");
-                        }
+                        if (fileObj instanceof TFile) data = Buffer.from(await vault.readBinary(fileObj));
+                        else throw new Error("내부 파일을 찾을 수 없음");
                     }
 
-                    // B. 안전한 파일명 생성 (특수문자 제거 + 타임스탬프)
                     const originalName = path.basename(item.imagePath);
-                    const safeName = originalName.replace(/[^a-zA-Z0-9가-힣.]/g, '_'); // 한글/영문/숫자 외엔 _로 변경
+                    const safeName = originalName.replace(/[^a-zA-Z0-9가-힣.]/g, '_');
                     const newFileName = `${Date.now()}_${safeName}`;
                     const newInternalPath = `${assetsFolder}/${newFileName}`;
 
-                    // C. Vault 내부에 파일 생성 (createBinary 사용)
-                    createdFile = await vault.createBinary(newInternalPath, data);
+                    const createdFile = await vault.createBinary(newInternalPath, data);
+                    imgTag = `![[${createdFile.path}]]`;
 
-                    // D. 🔥 [중요] 생성된 TFile 객체로부터 직접 Resource Path 추출
-                    // 이 방식이 가장 확실하게 이미지를 띄워줍니다.
-                    resourcePath = vault.getResourcePath(createdFile);
-					if (item.isExternal) {
-                        try {
-                            // fs.unlinkSync: 파일을 영구 삭제하는 Node.js 명령어
-                            fs.unlinkSync(item.imagePath);
-                            console.log(`원본 삭제 완료: ${item.imagePath}`);
-                        } catch (delErr) {
-                            console.error(`원본 삭제 실패 (권한 또는 잠금 문제): ${item.imagePath}`, delErr);
-                            new Notice(`⚠️ 이미지는 저장됐지만 원본 삭제 실패: ${originalName}`);
-                        }
+                    if (item.isExternal) {
+                        try { fs.unlinkSync(item.imagePath); } catch (delErr) { console.error(`원본 삭제 실패`, delErr); }
                     }
-                    // 디버깅용 (혹시 또 안 나오면 Console 확인)
-                    console.log(`이미지 저장 성공: ${newInternalPath} -> ${resourcePath}`);
-
                 } catch (e) {
                     console.error("이미지 처리 실패:", e);
-                    // 실패 시 엑박 대신 에러 메시지 표시
-                    resourcePath = "";
-                    imgTag = `❌ 이미지 로드 실패`;
-                }
-				if (resourcePath && createdFile) {
-                    const vaultRoot = this.app.vault.getRoot().path;
-                    const relativePath = path.relative(vaultRoot, createdFile.path);
-                    imgTag = `<div class="cpa-img-container"><img src="${relativePath}" class="cpa-clickable-img"></div>`;
-                } else {
                     imgTag = `❌ 이미지 로드 실패`;
                 }
             }
-
-            chunk += `| ${safeSubject} | ${imgTag} | ${safeAnswer} | ${scrollableSolution} |  |\n`;
+            chunk += `| ${safeSubject} | ${imgTag} | ${safeNumber}: ${safeAnswer} | ${scrollableSolution} |  |\n`;
         }
 
         if (!fileExists) {
-            const header = `---
-cssclasses: cpa-log
----
-
-| 과목 | 문제 | 정답 | 풀이 | 비고 |
-|:---:|:---|:---|:---|:---|
-`;
+            const header = `---\ncssclasses: cpa-log\n---\n\n| 과목 | 문제 | 정답 | 풀이 | 비고 |\n|:---:|:---|:---|:---|:---|\n`;
             await vault.create(targetPath, header + chunk);
-            new Notice(`새 파일 생성됨: ${targetPath}`);
         } else {
             const file = vault.getAbstractFileByPath(targetPath);
-            if (file instanceof TFile) {
-                await vault.process(file, (data) => {
-                    return data + chunk;
-                });
-                new Notice(`내용 추가됨: ${targetPath}`);
-            }
+            if (file instanceof TFile) await vault.process(file, (data) => data + chunk);
         }
     }
 
@@ -370,210 +437,44 @@ cssclasses: cpa-log
         let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
         const start = clean.indexOf('[');
         const end = clean.lastIndexOf(']');
-        if (start === -1 || end === -1) { throw new Error("JSON Array brackets not found"); }
+        if (start === -1 || end === -1) throw new Error("JSON Array brackets not found");
         clean = clean.substring(start, end + 1);
         clean = clean.replace(/,(\s*\])/g, '$1');
+
+        // 🔥 [추가된 핵심 방어 로직] 
+        // LLM이 JSON 문자열 안에 무심코 쓴 LaTeX 백슬래시(\times)나 특수기호(\$)를 
+        // JSON 파서가 에러 없이 읽을 수 있도록 이중 백슬래시(\\)로 안전하게 치환합니다.
+        // (단, JSON 문자열 구조를 유지해야 하는 따옴표 이스케이프(\")는 건드리지 않습니다.)
+        clean = clean.replace(/\\(?=[^\\"])/g, '\\\\');
+
         try { return JSON.parse(clean); }
-        catch (e) { clean = clean.replace(/,\s*}/g, '}'); return JSON.parse(clean); }
+        catch (e) { 
+            clean = clean.replace(/,\s*}/g, '}'); 
+            return JSON.parse(clean); 
+        }
     }
 
-	// 🧹 데이터 정제 함수 (MathJax 납치 방지 버전)
+    // 🧹 데이터 정제 함수 (치환 전략 + 중복 이스케이프 방지 적용)
     sanitizeForTable(text: string): string {
         if (!text) return "";
         let clean = text;
+        
         clean = clean.replace(/^```(json|markdown|text)?/i, '').replace(/```$/i, '');
         clean = clean.replace(/^`/, '').replace(/`$/, '');
         clean = clean.replace(/\|/g, '&#124;');
-        clean = clean.replace(/\$([0-9,.]+)\$/g, '&#36;$1');
-        clean = clean.replace(/\$/g, '&#36;');
+        
+        // 🔥 [수정됨] 텍스트 내의 '$'를 텍스트용(\$)으로 강제 이스케이프하되,
+        // LLM이 이미 백슬래시를 붙여둔 경우(?<!\\)는 중복해서 이스케이프하지 않음
+        clean = clean.replace(/(?<!\\)\$/g, '\\$');
+        
+        // LLM이 작성한 수식 태그 [MATH]...[/MATH] 를 찾아내서 마크다운 진짜 수식 기호인 $...$ 로 변환
+        clean = clean.replace(/\[MATH\](.*?)\[\/MATH\]/g, '$$$1$$');
+        
         clean = clean.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\\n/g, '<br>');
+        
         return clean.trim();
     }
 
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
     async saveSettings() { await this.saveData(this.settings); if (this.settings.geminiApiKey) this.genAI = new GoogleGenerativeAI(this.settings.geminiApiKey); }
-}
-
-// 📝 [파일 선택 모달] (기존 동일)
-class TargetFileSuggestModal extends SuggestModal<TFile | string> {
-    plugin: ErrorLogPlugin;
-    onChoose: (path: string) => void;
-
-    constructor(app: App, plugin: ErrorLogPlugin, onChoose: (path: string) => void) {
-        super(app);
-        this.plugin = plugin;
-        this.onChoose = onChoose;
-        this.setPlaceholder("오답노트 파일을 검색하거나, 새 파일명을 입력하세요...");
-    }
-
-    getSuggestions(query: string): (TFile | string)[] {
-        const files = this.app.vault.getMarkdownFiles().filter(f => f.path.toLowerCase().includes(query.toLowerCase()));
-        const suggestions: (TFile | string)[] = [...files];
-        if (query.trim().length > 0) {
-            const exactMatch = files.some(f => f.path === query || f.path === query + ".md");
-            if (!exactMatch) suggestions.unshift(query);
-        }
-        return suggestions;
-    }
-
-    renderSuggestion(item: TFile | string, el: HTMLElement) {
-        if (typeof item === 'string') {
-            el.createEl("div", { text: `➕ 새 파일 생성: "${item}${item.endsWith('.md') ? '' : '.md'}"`, cls: "suggestion-title", attr: {style: "color: var(--interactive-accent); font-weight: bold;"} });
-        } else {
-            el.createEl("div", { text: item.basename, cls: "suggestion-title" });
-            const parentPath = item.parent?.path === '/' ? 'Root' : item.parent?.path;
-            if (parentPath && parentPath !== '/') el.createEl("small", { text: parentPath, cls: "suggestion-content", attr: { style: "color: var(--text-muted);" } });
-            const cache = this.app.metadataCache.getFileCache(item);
-            if (cache?.frontmatter?.cssclasses?.includes('cpa-log')) el.createEl("span", { text: " 🏷️ Log File", attr: { style: "color: var(--text-accent); font-size: 0.8em; margin-left: 5px;" } });
-        }
-    }
-
-    onChooseSuggestion(item: TFile | string, evt: MouseEvent | KeyboardEvent) {
-        let path = "";
-        if (typeof item === 'string') { path = item; if (!path.endsWith('.md')) path += '.md'; new Notice(`새 파일 모드: ${path}`); }
-        else { path = item.path; }
-        this.onChoose(path);
-    }
-}
-
-// 🖼️ [이미지 선택 모달] (기존 동일)
-class MultiSelectModal extends Modal {
-    selectedFiles: Set<UniversalFile> = new Set();
-    onProcess: (files: UniversalFile[]) => void;
-    onChangeFolder: (newFolder: string) => void;
-    plugin: ErrorLogPlugin;
-
-    constructor(app: App, plugin: ErrorLogPlugin, onProcess: (files: UniversalFile[]) => void, onChangeFolder: (newFolder: string) => void) {
-        super(app);
-        this.plugin = plugin;
-        this.onProcess = onProcess;
-        this.onChangeFolder = onChangeFolder;
-    }
-
-    async pickFolderNative() {
-        const folder = await pickFolderMac();
-        if (folder) {
-            new Notice(`폴더 변경됨: ${folder}`);
-            this.onChangeFolder(folder);
-            this.close();
-        }
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        const headerDiv = contentEl.createDiv();
-        headerDiv.style.display = "flex"; headerDiv.style.justifyContent = "space-between"; headerDiv.style.alignItems = "center"; headerDiv.style.marginBottom = "15px";
-        headerDiv.createEl("h2", { text: "Select Images", attr: { style: "margin: 0;" } });
-
-        const currentFolder = this.plugin.settings.imageSourcePath || "(Root)";
-        new ButtonComponent(headerDiv).setButtonText(`📂 폴더 변경`).setTooltip(`현재: ${currentFolder}`).onClick(() => { this.pickFolderNative(); });
-
-        const div = contentEl.createDiv();
-        div.style.maxHeight="400px"; div.style.overflowY="auto"; div.style.border = "1px solid var(--background-modifier-border)"; div.style.padding = "10px"; div.style.borderRadius = "5px";
-
-        let files: UniversalFile[] = [];
-        const exts = ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.webp'];
-
-        if (path.isAbsolute(currentFolder) && fs.existsSync(currentFolder)) {
-            try {
-                const dirFiles = fs.readdirSync(currentFolder);
-                files = dirFiles.filter(name => exts.includes(path.extname(name).toLowerCase())).map(name => {
-                    const fullPath = path.join(currentFolder, name);
-                    const stat = fs.statSync(fullPath);
-                    return { name: name, path: fullPath, mtime: stat.mtimeMs, isExternal: true, extension: path.extname(name).substring(1).toLowerCase() };
-                });
-            } catch (err) { new Notice(`폴더 읽기 실패: ${err}`); }
-        } else {
-            const targetFolder = currentFolder === '(Root)' ? '' : currentFolder;
-            files = this.app.vault.getFiles().filter(f => {
-                const ext = '.' + f.extension.toLowerCase();
-                const isInFolder = targetFolder === '' || targetFolder === '/' || f.path.startsWith(targetFolder);
-                return exts.includes(ext) && isInFolder;
-            }).map(f => ({ name: f.name, path: f.path, mtime: f.stat.mtime, isExternal: false, extension: f.extension, originalObject: f }));
-        }
-
-        files.sort((a,b) => b.mtime - a.mtime);
-        if (files.length === 0) div.createEl("div", { text: "⚠️ 해당 폴더에 이미지가 없습니다.", attr: { style: "padding: 20px; text-align: center; color: var(--text-muted);" } });
-
-        files.slice(0, 100).forEach(f => {
-            new Setting(div).setName(f.name).setDesc(new Date(f.mtime).toLocaleDateString()).addToggle(t => t.onChange(c => c ? this.selectedFiles.add(f) : this.selectedFiles.delete(f)));
-        });
-
-        new Setting(contentEl).addButton(b => b.setButtonText("Start Analysis 🚀").setCta().onClick(() => { this.close(); this.onProcess(Array.from(this.selectedFiles)); }));
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-// ⚙️ 설정 탭 (🔥 첨부파일 경로 설정 추가)
-class ErrorLogSettingTab extends PluginSettingTab {
-    plugin: ErrorLogPlugin;
-    constructor(app: App, plugin: ErrorLogPlugin) { super(app, plugin); this.plugin = plugin; }
-
-    display(): void {
-        const {containerEl} = this;
-        containerEl.empty();
-
-        new Setting(containerEl)
-            .setName('Gemini API Key')
-            .setDesc('Google AI Studio API Key')
-            .addText(t => t.setValue(this.plugin.settings.geminiApiKey).onChange(async v => { this.plugin.settings.geminiApiKey = v; await this.plugin.saveSettings(); }));
-
-        // 🔥 [New] 첨부파일 저장 경로 설정
-        new Setting(containerEl)
-            .setName('Attachment Folder')
-            .setDesc('이미지를 복사해둘 Vault 내 폴더명입니다. (예: CPA_Attachments)')
-            .addText(t => t
-                .setPlaceholder('CPA_Attachments')
-                .setValue(this.plugin.settings.attachmentsPath)
-                .onChange(async v => {
-                    this.plugin.settings.attachmentsPath = v;
-                    await this.plugin.saveSettings();
-                }));
-
-        // 이미지 소스 폴더
-        const folderSetting = new Setting(containerEl)
-            .setName('Default Input Folder')
-            .setDesc('입력 이미지를 불러올 기본 폴더입니다.')
-            .addText(t => t.setValue(this.plugin.settings.imageSourcePath).setDisabled(true));
-        folderSetting.addButton(btn => {
-            btn.setButtonText("📂 폴더 선택 (macOS)")
-               .onClick(async () => {
-                   const folder = await pickFolderMac();
-                   if (folder) { this.plugin.settings.imageSourcePath = folder; await this.plugin.saveSettings(); this.display(); }
-               });
-        });
-
-        // 모델 설정
-        const modelSetting = new Setting(containerEl).setName('Gemini Model').addDropdown(async d => {
-            const current = this.plugin.settings.modelName;
-            let opts: Record<string, string> = { ...DEFAULT_MODELS };
-            if (current && !opts[current]) opts[current] = `${current} (Current)`;
-            d.addOptions(opts).setValue(current).onChange(async v => { this.plugin.settings.modelName = v; await this.plugin.saveSettings(); });
-        });
-        modelSetting.addExtraButton((btn) => {
-            btn.setIcon('sync').onClick(async () => { /* (Fetch logic 생략 - 위와 동일) */
-                 if (!this.plugin.settings.geminiApiKey) { new Notice('⚠️ API Key Required'); return; }
-                 new Notice('Fetching models... ⏳');
-                 try {
-                     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${this.plugin.settings.geminiApiKey}`);
-                     if (!response.ok) throw new Error(response.statusText);
-                     const data = await response.json();
-                     const validModels = data.models.filter((m: any) => m.name.includes('gemini') && m.supportedGenerationMethods?.includes('generateContent'));
-                     const dropdownEl = modelSetting.controlEl.querySelector('select') as HTMLSelectElement;
-                     if (dropdownEl && validModels.length > 0) {
-                         dropdownEl.innerHTML = '';
-                         validModels.forEach((m: any) => {
-                             const id = m.name.replace('models/', '');
-                             const option = document.createElement('option');
-                             option.value = id;
-                             option.text = `${m.displayName} (${m.version || 'latest'})`;
-                             dropdownEl.add(option);
-                         });
-                         dropdownEl.value = this.plugin.settings.modelName;
-                         new Notice(`✅ ${validModels.length} Models Loaded`);
-                     }
-                 } catch (e) { console.error(e); new Notice('Failed to fetch models'); }
-            });
-        });
-    }
 }
