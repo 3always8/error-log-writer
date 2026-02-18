@@ -277,6 +277,7 @@ export default class ErrorLogPlugin extends Plugin {
 
             const showImage = (item.imagePath !== currentPath);
             currentPath = item.imagePath;
+            let createdFile: TFile | null = null;
 
             let imgTag = "";
             if (showImage) {
@@ -308,7 +309,7 @@ export default class ErrorLogPlugin extends Plugin {
                     const newInternalPath = `${assetsFolder}/${newFileName}`;
 
                     // C. Vault 내부에 파일 생성 (createBinary 사용)
-                    const createdFile = await vault.createBinary(newInternalPath, data);
+                    createdFile = await vault.createBinary(newInternalPath, data);
 
                     // D. 🔥 [중요] 생성된 TFile 객체로부터 직접 Resource Path 추출
                     // 이 방식이 가장 확실하게 이미지를 띄워줍니다.
@@ -332,8 +333,10 @@ export default class ErrorLogPlugin extends Plugin {
                     resourcePath = "";
                     imgTag = `❌ 이미지 로드 실패`;
                 }
-				if (resourcePath) {
-                    imgTag = `<div class="cpa-img-container"><img src="${resourcePath}" class="cpa-clickable-img"></div>`;
+				if (resourcePath && createdFile) {
+                    const vaultRoot = this.app.vault.getRoot().path;
+                    const relativePath = path.relative(vaultRoot, createdFile.path);
+                    imgTag = `<div class="cpa-img-container"><img src="${relativePath}" class="cpa-clickable-img"></div>`;
                 } else {
                     imgTag = `❌ 이미지 로드 실패`;
                 }
