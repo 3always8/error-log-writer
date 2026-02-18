@@ -22,7 +22,7 @@ export default class ErrorLogPlugin extends Plugin {
 
         // 리본 아이콘
         this.addRibbonIcon('brain-circuit', 'Create Error Log', (evt: MouseEvent) => {
-            if (!this.settings.geminiApiKey) { new Notice('⚠️ API Key Required'); return; }
+            if (!this.settings.geminiApiKey) { new Notice('⚠️ API Key Required', 0); return; }
             new TargetFileSuggestModal(this.app, this, (selectedPath) => {
                 this.settings.lastUsedPath = selectedPath;
                 this.saveSettings();
@@ -92,7 +92,6 @@ export default class ErrorLogPlugin extends Plugin {
         ).open();
     }
 
-    // 🚀 일괄 처리 로직 (PDF 분해 + Chunk 단위 LLM 전송)
     async batchProcessImages(files: UniversalFile[], targetPath: string) {
         if (files.length === 0) return;
 
@@ -101,59 +100,96 @@ export default class ErrorLogPlugin extends Plugin {
             await this.app.vault.createFolder(assetsFolder);
         }
 
-        // 1. PDF를 이미지로 쪼개서 목록(Flat) 만들기
-        let processableFiles: UniversalFile[] = [];
-        for (const file of files) {
-            if (file.extension.toLowerCase() === 'pdf') {
-                const splitImages = await this.convertPdfToImages(file, assetsFolder);
-                processableFiles.push(...splitImages);
+        // 🔥 [해결 1] 전체 진행 상태를 관리하는 단일 Notice 객체 생성 (사라지지 않음)
+        const progressNotice = new Notice('작업 준비 중...', 0);
+
+        try {
+            // 1. PDF를 이미지로 쪼개서 목록(Flat) 만들기
+            progressNotice.setMessage('PDF 및 이미지 파일 전처리 중입니다...');
+            let processableFiles: UniversalFile[] = [];
+
+            for (const file of files) {
+                if (file.extension.toLowerCase() === 'pdf') {
+                    // 참고: convertPdfToImages 내부에도 Notice가 있다면 화면에 잠시 두 개가 뜰 수 있습니다.
+                    const splitImages = await this.convertPdfToImages(file, assetsFolder, progressNotice);
+                    processableFiles.push(...splitImages);
+                } else {
+                    processableFiles.push(file);
+                }
+            }
+
+            if (processableFiles.length === 0) {
+                progressNotice.hide();
+                new Notice("⚠️ 처리할 이미지가 없습니다.", 5000);
+                return;
+            }
+
+            let allProblems: ProblemItem[] = [];
+            const CHUNK_SIZE = 5; // 한 번에 API에 전송할 이미지 수
+            const totalChunks = Math.ceil(processableFiles.length / CHUNK_SIZE);
+
+            progressNotice.setMessage(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
+
+            // 2. Chunk 단위로 묶어서 LLM 통신
+            for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+                const start = chunkIdx * CHUNK_SIZE;
+                const end = start + CHUNK_SIZE;
+                const chunkFiles = processableFiles.slice(start, end);
+
+                // 🔥 [해결 2] 새로운 Notice를 띄우지 않고 기존 Notice의 텍스트만 동적 교체
+                progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] AI 분석 중... (${chunkFiles.length}장 처리)`);
+
+                const problems = await this.fetchProblemsFromLLM(chunkFiles);
+                if (problems && problems.length > 0) {
+                    allProblems.push(...problems);
+                }
+
+                if (chunkIdx < totalChunks - 1) {
+                    progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] API 쿨타임 대기 중...`);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+            }
+
+            // 3. 분석 결과 파일에 저장
+            if (allProblems.length > 0) {
+                progressNotice.setMessage(`분석 완료! 마크다운 파일 생성 중... 📝`);
+                await this.saveToMarkdown(allProblems, targetPath);
+
+                // 🔥 [해결 3] 모든 작업이 성공적으로 끝났을 때만 기존 알림을 숨기고 성공 알림 표시
+                progressNotice.hide();
+                new Notice("🎉 오답노트 작성이 완료되었습니다!", 5000);
+
+                const file = this.app.vault.getAbstractFileByPath(targetPath);
+                if (file instanceof TFile) {
+                    const leaves = this.app.workspace.getLeavesOfType('markdown');
+                    const existingLeaf = leaves.find(leaf => {
+                        const view = leaf.view as any;
+                        return view.file && view.file.path === file.path;
+                    });
+                    if (existingLeaf) this.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
+                    else await this.app.workspace.getLeaf('tab').openFile(file);
+                }
             } else {
-                processableFiles.push(file);
-            }
-        }
-
-        if (processableFiles.length === 0) return;
-
-        let allProblems: ProblemItem[] = [];
-        const CHUNK_SIZE = 5; // 한 번에 API에 전송할 이미지 수
-        const totalChunks = Math.ceil(processableFiles.length / CHUNK_SIZE);
-
-        new Notice(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
-
-        // 2. Chunk 단위로 묶어서 LLM 통신
-        for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-            const start = chunkIdx * CHUNK_SIZE;
-            const end = start + CHUNK_SIZE;
-            const chunkFiles = processableFiles.slice(start, end);
-
-            new Notice(`[묶음 ${chunkIdx + 1}/${totalChunks}] AI 분석 중... (${chunkFiles.length}장 처리)`);
-
-            const problems = await this.fetchProblemsFromLLM(chunkFiles); // 🔥 이름 변경됨
-            if (problems && problems.length > 0) {
-                allProblems.push(...problems);
+                progressNotice.hide();
+                new Notice("⚠️ 추출된 문제가 없습니다.", 5000);
             }
 
-            if (chunkIdx < totalChunks - 1) await new Promise(resolve => setTimeout(resolve, 3000));
-        }
+        } catch (error: unknown) {
+            // 🔥 LLM 통신이나 파일 저장 중 에러가 발생하면 무조건 알림을 끄고 에러 표출
+            progressNotice.hide();
 
-        // 3. 분석 결과 파일에 저장
-        if (allProblems.length > 0) {
-            new Notice(`분석 완료! 저장 중... 📝`);
-            await this.saveToMarkdown(allProblems, targetPath);
-            new Notice("🎉 오답노트 작성이 완료되었습니다!");
-
-            const file = this.app.vault.getAbstractFileByPath(targetPath);
-            if (file instanceof TFile) {
-                const leaves = this.app.workspace.getLeavesOfType('markdown');
-                const existingLeaf = leaves.find(leaf => {
-                    const view = leaf.view as any;
-                    return view.file && view.file.path === file.path;
-                });
-                if (existingLeaf) this.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
-                else await this.app.workspace.getLeaf('tab').openFile(file);
+            // 안전하게 에러 메시지 추출 (Type Guard)
+            let errorMessage = "알 수 없는 오류가 발생했습니다.";
+            if (error instanceof Error) {
+                errorMessage = error.message;
+            } else if (typeof error === "string") {
+                errorMessage = error;
+            } else {
+                errorMessage = String(error);
             }
-        } else {
-            new Notice("⚠️ 추출된 문제가 없습니다.");
+
+            new Notice(`❌ 일괄 처리 중 오류 발생: ${errorMessage}`, 10000);
+            console.error("Batch Process Error:", error); // 콘솔에 원본 객체 상세 로깅
         }
     }
 
@@ -202,7 +238,7 @@ export default class ErrorLogPlugin extends Plugin {
                 extractedData = this.parseRoughJson(textResponse);
             } catch (e) {
                 await this.writeDebugLog("JSON_PARSE_ERROR", `JSON 파싱 실패`, e);
-                new Notice(`⚠️ 묶음 분석 실패 (형식 오류)`);
+                // 메인 알림을 방해하지 않도록 에러 로깅만 하고 Notice는 띄우지 않습니다.
                 return null;
             }
 
@@ -249,10 +285,19 @@ export default class ErrorLogPlugin extends Plugin {
         }
     }
 
-    async convertPdfToImages(pdfFile: UniversalFile, targetFolder: string): Promise<UniversalFile[]> {
+    async convertPdfToImages(pdfFile: UniversalFile, targetFolder: string, sharedNotice?: Notice): Promise<UniversalFile[]> {
         await this.writeDebugLog("PDF_CONVERT_START", `정밀 렌더링 엔진 가동: ${pdfFile.name}`);
         const { vault } = this.app;
         const generatedImages: UniversalFile[] = [];
+
+        let progressNotice: Notice;
+        if (sharedNotice) {
+            progressNotice = sharedNotice;
+            progressNotice.setMessage(`PDF 고화질 변환 중입니다... (${pdfFile.name})`);
+        } else {
+            progressNotice = new Notice(`PDF 고화질 변환 중입니다... (${pdfFile.name})`, 0);
+        }
+        let pdfDocument: any = null; // finally 블록에서 자원을 해제하기 위해 외부 스코프에 선언
 
         try {
             let data: ArrayBuffer;
@@ -262,32 +307,23 @@ export default class ErrorLogPlugin extends Plugin {
                 data = await vault.readBinary(pdfFile.originalObject as TFile);
             }
 
-            // 🔥 [해결 1] 라이브러리 버전을 동적으로 확인하여 워커 주소 일치시킴
             if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
                 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
             }
 
-            // const loadingTask = pdfjsLib.getDocument({
-            //     data: new Uint8Array(data),
-            //     // 워커 로드 실패 시 메인 스레드에서라도 실행하도록 함 (약간 느려질 수 있으나 작동은 함)
-            //     disableWorker: false,
-            //     stopAtErrors: false
-            // });
-
             const loadingTask = pdfjsLib.getDocument({
                 data: new Uint8Array(data),
-                // 폰트 로딩 문제 방지
                 disableFontFace: false
             });
 
-            const pdfDocument = await loadingTask.promise;
+            pdfDocument = await loadingTask.promise;
             const numPages = pdfDocument.numPages;
 
             for (let pageNum = 1; pageNum <= numPages; pageNum++) {
                 const page = await pdfDocument.getPage(pageNum);
 
-                // 🔥 [해결 2] 스케일을 1.2로 약간 낮춰 메모리 압박 감소 (CPA 시험지는 1.2로도 충분합니다)
-                const viewport = page.getViewport({ scale: 1.2 });
+                // 🔥 [핵심 1] 화질 완전 보존: 스케일을 4.0으로 대폭 상향 (CPA 수식/작은 글씨 깨짐 방지)
+                const viewport = page.getViewport({ scale: 4.0 });
 
                 const canvas = document.createElement('canvas');
                 const context = canvas.getContext('2d', { alpha: false }); // 성능 향상을 위해 알파 채널 제거
@@ -297,7 +333,6 @@ export default class ErrorLogPlugin extends Plugin {
                 canvas.height = viewport.height;
                 canvas.width = viewport.width;
 
-                // 🔥 [해결 3] 렌더링 태스크에 명시적인 에러 캐칭 추가
                 const renderContext = {
                     canvasContext: context,
                     viewport: viewport,
@@ -310,7 +345,8 @@ export default class ErrorLogPlugin extends Plugin {
                     await renderTask.promise;
                 } catch (renderErr) {
                     await this.writeDebugLog("RENDER_TASK_ERROR", `페이지 ${pageNum} 렌더링 실패`, renderErr);
-                    continue; // 한 페이지 실패해도 다음 페이지 시도
+                    page.cleanup(); // 실패 시에도 메모리 누수 방지를 위해 정리
+                    continue;
                 }
 
                 const dataUrl = canvas.toDataURL('image/png');
@@ -332,18 +368,42 @@ export default class ErrorLogPlugin extends Plugin {
                     originalObject: createdFile
                 });
 
-                // 메모리 해제 지원
+                // 🔥 [핵심 2] 메모리 스파이크 통제: 캔버스 비우기 + pdf.js 내부 캐시 강제 반환
                 canvas.width = 0;
                 canvas.height = 0;
+                page.cleanup();
             }
 
             await this.writeDebugLog("PDF_CONVERT_SUCCESS", `성공적으로 ${generatedImages.length}개 이미지 생성`);
+
+            // 2. 작업 완료: 진행 중 알림을 숨기고 성공 알림 표시
+            if (!sharedNotice) {
+                progressNotice.hide();
+                new Notice(`✅ PDF 변환 완료: ${numPages}페이지 (고화질 보존)`, 5000);
+            }
             return generatedImages;
 
-        } catch (error) {
+            } catch (error) {
             await this.writeDebugLog("PDF_CONVERT_FATAL", `PDF 처리 파이프라인 붕괴`, error);
-            new Notice(`❌ PDF 변환 실패: ${pdfFile.name}`);
+
+            // 에러 시에도 공유 객체 여부에 따라 다르게 처리
+            if (!sharedNotice) {
+                progressNotice.hide();
+                new Notice(`❌ PDF 변환 실패: ${pdfFile.name}`, 10000);
+            } else {
+                progressNotice.setMessage(`❌ PDF 변환 실패: ${pdfFile.name}`);
+            }
+
             return [];
+        } finally {
+            // 🔥 [핵심 3] 문서 완전 파기: 루프가 끝난 뒤 전체 워커와 메모리를 시스템에 반환
+            if (pdfDocument) {
+                try {
+                    await pdfDocument.destroy();
+                } catch (e) {
+                    await this.writeDebugLog("PDF_DESTROY_ERROR", `문서 객체 파기 중 오류 발생`, e);
+                }
+            }
         }
     }
 
@@ -441,37 +501,49 @@ export default class ErrorLogPlugin extends Plugin {
         clean = clean.substring(start, end + 1);
         clean = clean.replace(/,(\s*\])/g, '$1');
 
-        // 🔥 [추가된 핵심 방어 로직] 
-        // LLM이 JSON 문자열 안에 무심코 쓴 LaTeX 백슬래시(\times)나 특수기호(\$)를 
+        // 🔥 [추가된 핵심 방어 로직]
+        // LLM이 JSON 문자열 안에 무심코 쓴 LaTeX 백슬래시(\times)나 특수기호(\$)를
         // JSON 파서가 에러 없이 읽을 수 있도록 이중 백슬래시(\\)로 안전하게 치환합니다.
         // (단, JSON 문자열 구조를 유지해야 하는 따옴표 이스케이프(\")는 건드리지 않습니다.)
         clean = clean.replace(/\\(?=[^\\"])/g, '\\\\');
 
         try { return JSON.parse(clean); }
-        catch (e) { 
-            clean = clean.replace(/,\s*}/g, '}'); 
-            return JSON.parse(clean); 
+        catch (e) {
+            clean = clean.replace(/,\s*}/g, '}');
+            return JSON.parse(clean);
         }
     }
 
-    // 🧹 데이터 정제 함수 (치환 전략 + 중복 이스케이프 방지 적용)
+    // 🧹 데이터 정제 함수 (수식 내부 줄바꿈 및 특수기호 완벽 제어 버전)
     sanitizeForTable(text: string): string {
         if (!text) return "";
         let clean = text;
-        
+
         clean = clean.replace(/^```(json|markdown|text)?/i, '').replace(/```$/i, '');
         clean = clean.replace(/^`/, '').replace(/`$/, '');
         clean = clean.replace(/\|/g, '&#124;');
-        
-        // 🔥 [수정됨] 텍스트 내의 '$'를 텍스트용(\$)으로 강제 이스케이프하되,
-        // LLM이 이미 백슬래시를 붙여둔 경우(?<!\\)는 중복해서 이스케이프하지 않음
+
+        // 1. [MATH] 태그 내부 집중 정제 (LLM이 지시를 잘 따랐을 때 발동)
+        clean = clean.replace(/\[MATH\]([\s\S]*?)\[\/MATH\]/g, (match, mathInner) => {
+            // A. 수식 내부의 줄바꿈이나 <br>은 테이블 붕괴 원인이므로 띄어쓰기로 압착
+            let refined = mathInner.replace(/(\r\n|\n|\r|<br>|\\n)/gm, '  ');
+
+            // B. 수식 내부에 달러($10,000)가 있으면 MathJax가 폭발하므로 강제 이스케이프 처리
+            refined = refined.replace(/(?<!\\)\$/g, '\\$');
+
+            // C. 혹시라도 LLM이 습관적으로 쓴 '*' 기호가 마크다운을 망치지 않도록 \times로 치환
+            refined = refined.replace(/\*/g, '\\times ');
+
+            // 완벽하게 정제된 수식을 옵시디언 MathJax 기호로 감싸서 배출
+            return `$${refined}$`;
+        });
+
+        // 2. 수식 처리가 끝난 후, 텍스트 구간에 남은 모든 '$'는 100% 금액이므로 안전하게 이스케이프
         clean = clean.replace(/(?<!\\)\$/g, '\\$');
-        
-        // LLM이 작성한 수식 태그 [MATH]...[/MATH] 를 찾아내서 마크다운 진짜 수식 기호인 $...$ 로 변환
-        clean = clean.replace(/\[MATH\](.*?)\[\/MATH\]/g, '$$$1$$');
-        
+
+        // 3. 텍스트 구간의 일반 줄바꿈을 표 내부용 <br>로 변경
         clean = clean.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\\n/g, '<br>');
-        
+
         return clean.trim();
     }
 
