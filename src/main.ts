@@ -6,8 +6,8 @@ import * as pdfjsLib from 'pdfjs-dist';
 import 'pdfjs-dist/build/pdf.worker.mjs';
 // 리팩토링된 모듈 불러오기
 import { ErrorLogSettings, DEFAULT_SETTINGS, UniversalFile, ProblemItem } from './types';
-import { CPA_GRADER_BATCH_PROMPT } from './prompts';
-import { TargetFileSuggestModal, MultiSelectModal } from './modals';
+import { CPA_GRADER_BATCH_PROMPT, TABLE_FIX_PROMPT } from './prompts';
+import { TargetFileSuggestModal, MultiSelectModal, ActionSelectModal } from './modals';
 import { ErrorLogSettingTab } from './settings';
 
 export default class ErrorLogPlugin extends Plugin {
@@ -26,7 +26,10 @@ export default class ErrorLogPlugin extends Plugin {
             new TargetFileSuggestModal(this.app, this, (selectedPath) => {
                 this.settings.lastUsedPath = selectedPath;
                 this.saveSettings();
-                this.openImageSelector(selectedPath);
+                new ActionSelectModal(this.app,
+                    () => this.openImageSelector(selectedPath),
+                    () => this.fixTableFormatting(selectedPath)
+                ).open();
             }).open();
         });
 
@@ -545,6 +548,174 @@ export default class ErrorLogPlugin extends Plugin {
         clean = clean.replace(/(\r\n|\n|\r)/gm, '<br>').replace(/\\n/g, '<br>');
 
         return clean.trim();
+    }
+
+    // 📋 테이블 수정 기능
+    async fixTableFormatting(targetPath: string): Promise<void> {
+        const progressNotice = new Notice('테이블 구조 분석 준비 중...', 0);
+
+        try {
+            const file = this.app.vault.getAbstractFileByPath(targetPath);
+            if (!(file instanceof TFile)) {
+                progressNotice.hide();
+                new Notice('파일을 찾을 수 없습니다: ' + targetPath, 5000);
+                return;
+            }
+
+            const originalContent = await this.app.vault.read(file);
+
+            if (!this.containsMarkdownTable(originalContent)) {
+                progressNotice.hide();
+                new Notice('이 파일에는 마크다운 테이블이 없습니다.', 5000);
+                return;
+            }
+
+            // 백업 파일 생성
+            const backupPath = targetPath.replace(/\.md$/, '_backup.md');
+            progressNotice.setMessage('백업 파일 생성 중...');
+            const backupExists = await this.app.vault.adapter.exists(backupPath);
+            if (backupExists) {
+                const backupFile = this.app.vault.getAbstractFileByPath(backupPath);
+                if (backupFile instanceof TFile) await this.app.vault.modify(backupFile, originalContent);
+            } else {
+                await this.app.vault.create(backupPath, originalContent);
+            }
+            await this.writeDebugLog("TABLE_FIX_BACKUP", `백업 생성: ${backupPath}`);
+
+            // 테이블 블록 추출
+            const tableBlocks = this.extractTableBlocks(originalContent);
+            if (tableBlocks.length === 0) {
+                progressNotice.hide();
+                new Notice('테이블 블록을 추출할 수 없습니다.', 5000);
+                return;
+            }
+
+            let result = originalContent;
+            let offset = 0;
+            let fixedCount = 0;
+            let skippedCount = 0;
+
+            for (let i = 0; i < tableBlocks.length; i++) {
+                const block = tableBlocks[i]!;
+                progressNotice.setMessage(`테이블 ${i + 1}/${tableBlocks.length} 수정 중...`);
+
+                const fixedTable = await this.fixTableViaLLM(block.text);
+
+                // 행 수 검증: 80% 미만이면 거부
+                const originalRows = block.text.split('\n').filter(l => l.trim().startsWith('|')).length;
+                const fixedRows = fixedTable.split('\n').filter(l => l.trim().startsWith('|')).length;
+
+                if (fixedRows < originalRows * 0.8) {
+                    await this.writeDebugLog("TABLE_FIX_REJECTED", `테이블 ${i + 1}: 행 수 검증 실패 (원본 ${originalRows}행 → 응답 ${fixedRows}행). 원본 유지.`);
+                    skippedCount++;
+                    continue;
+                }
+
+                const adjustedStart = block.start + offset;
+                const adjustedEnd = block.end + offset;
+                result = result.substring(0, adjustedStart) + fixedTable + result.substring(adjustedEnd);
+                offset += fixedTable.length - block.text.length;
+                fixedCount++;
+
+                if (i < tableBlocks.length - 1) {
+                    progressNotice.setMessage(`API 쿨타임 대기 중... (${i + 1}/${tableBlocks.length})`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+            }
+
+            if (result === originalContent) {
+                progressNotice.hide();
+                new Notice('테이블 구조에 문제가 없습니다. 수정 사항 없음.', 5000);
+                return;
+            }
+
+            progressNotice.setMessage('수정된 내용을 저장하는 중...');
+            await this.app.vault.modify(file, result);
+
+            progressNotice.hide();
+            let msg = `테이블 수정 완료! (${fixedCount}개 수정`;
+            if (skippedCount > 0) msg += `, ${skippedCount}개 검증 실패로 건너뜀`;
+            msg += `)`;
+            new Notice(msg, 5000);
+
+            // 파일 열기/포커스
+            const leaves = this.app.workspace.getLeavesOfType('markdown');
+            const existingLeaf = leaves.find(leaf => {
+                const view = leaf.view as any;
+                return view.file && view.file.path === file.path;
+            });
+            if (existingLeaf) this.app.workspace.setActiveLeaf(existingLeaf, { focus: true });
+            else await this.app.workspace.getLeaf('tab').openFile(file);
+
+        } catch (error: unknown) {
+            progressNotice.hide();
+            let errorMessage = "알 수 없는 오류가 발생했습니다.";
+            if (error instanceof Error) errorMessage = error.message;
+            else if (typeof error === "string") errorMessage = error;
+            else errorMessage = String(error);
+
+            new Notice(`테이블 수정 중 오류 발생: ${errorMessage}`, 10000);
+            console.error("Table Fix Error:", error);
+            await this.writeDebugLog("TABLE_FIX_ERROR", `테이블 수정 실패`, error);
+        }
+    }
+
+    async fixTableViaLLM(tableText: string): Promise<string> {
+        const modelName = this.settings?.modelName || "gemini-2.0-flash";
+        const model = this.genAI.getGenerativeModel({ model: modelName });
+
+        const result = await model.generateContent([
+            TABLE_FIX_PROMPT,
+            `\n--- [테이블 시작] ---\n${tableText}\n--- [테이블 끝] ---\n`
+        ]);
+
+        let response = result.response.text();
+        await this.writeDebugLog("TABLE_FIX_RAW", "테이블 수정 LLM 응답 수신", response);
+
+        // 코드펜스 제거
+        response = response.replace(/^```(?:markdown|md)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+
+        return response;
+    }
+
+    extractTableBlocks(content: string): { start: number; end: number; text: string }[] {
+        const lines = content.split('\n');
+        const blocks: { start: number; end: number; text: string }[] = [];
+        let tableStart = -1;
+        let charPos = 0;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!;
+            const isTableLine = line.trim().startsWith('|');
+
+            if (isTableLine && tableStart === -1) {
+                tableStart = charPos;
+            } else if (!isTableLine && tableStart !== -1) {
+                blocks.push({
+                    start: tableStart,
+                    end: charPos - 1, // 이전 줄 끝 (줄바꿈 제외)
+                    text: content.substring(tableStart, charPos - 1)
+                });
+                tableStart = -1;
+            }
+
+            charPos += line.length + 1; // +1 for \n
+        }
+
+        // 파일 끝이 테이블인 경우
+        if (tableStart !== -1) {
+            blocks.push({
+                start: tableStart,
+                end: content.length,
+                text: content.substring(tableStart)
+            });
+        }
+
+        return blocks;
+    }
+
+    containsMarkdownTable(content: string): boolean {
+        return /^\|.+\|$/m.test(content);
     }
 
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
