@@ -128,7 +128,7 @@ export default class ErrorLogPlugin extends Plugin {
             }
 
             let allProblems: ProblemItem[] = [];
-            const CHUNK_SIZE = 5; // 한 번에 API에 전송할 이미지 수
+            const CHUNK_SIZE = 2; // 한 번에 API에 전송할 이미지 수
             const totalChunks = Math.ceil(processableFiles.length / CHUNK_SIZE);
 
             progressNotice.setMessage(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
