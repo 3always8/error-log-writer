@@ -33,6 +33,38 @@ export interface UniversalFile {
     originalObject?: TFile;
 }
 
+// NEW: Data structures for answer key and explanation extraction
+export interface AnswerItem {
+    number: string;    // Problem number (e.g., "1", "41", "Question 1")
+    answer: string;    // Answer (e.g., "A", "B", "D")
+}
+
+export interface ExplanationItem {
+    number: string;    // Problem number (e.g., "1", "41", "Question 1")
+    explanation: string; // Full explanation text
+    answer?: string;   // Optional: the correct answer from explanation
+}
+
+export interface ParsedAnswers {
+    answerKey: AnswerItem[];       // Direct answer key (e.g., [{number: "1", answer: "A"}])
+    explanations: ExplanationItem[]; // Detailed explanations per problem
+    sourceFormat: 'format1' | 'format2' | 'format3' | 'none';
+}
+
+export interface PdfTextContent {
+    fullText: string;           // All text from PDF
+    pages: PdfPageText[];       // Text per page
+    answerSectionText: string;  // Text from answer/explanation section
+    questionSectionText: string; // Text from question section
+    isScanned: boolean;         // Whether PDF was scanned (required OCR)
+    extractionMethod: 'pdf-parse' | 'gemini-vision' | 'hybrid';
+}
+
+export interface PdfPageText {
+    pageNumber: number;
+    text: string;
+}
+
 export interface ProblemItem {
     subject: string;
     answer: string;
@@ -41,4 +73,8 @@ export interface ProblemItem {
     imagePath: string;
     isExternal: boolean;
     image_index?: number; // Batch 처리용 인덱스
+    // NEW: Reference to parsed answer key
+    expectedAnswer?: string;       // From PDF answer key, if available
+    // NEW: Reference to parsed explanation
+    referenceExplanation?: string; // From PDF explanation, if available
 }

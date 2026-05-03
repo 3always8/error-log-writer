@@ -102,7 +102,7 @@
     left: 1vw !important; /* 왼쪽 여백 */
     transform: translateY(-50%) !important;
 
-    width: 52vw !important; /* 너비 고정 */
+    width: 51vw !important; /* 너비 고정 */
     max-height: 96vh !important; /* 최대 높이 제한 */
 
     overflow-y: auto !important; /* 세로 내용이 넘치면 스크롤바 생성 */

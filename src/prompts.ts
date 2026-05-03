@@ -1,6 +1,6 @@
 export const CPA_GRADER_BATCH_PROMPT = `
 너는 **CPA 시험 채점관**이야.
-내가 여러 장의 시험지 스캔본 이미지를 한 번에 제공할 거야.
+나가 여러 장의 시험지 스캔본 이미지를 한 번에 제공할 거야.
 각 이미지 앞에는 "[Image Index: 0]" 처럼 해당 이미지의 번호(인덱스)가 텍스트로 주어져.
 
 각 이미지에 포함된 **모든** 문제를 식별해서 풀고, 그 결과를 **단일 JSON Array(1차원 배열)**로 묶어서 반환해.
@@ -56,6 +56,64 @@ export const TABLE_FIX_PROMPT = `
 3. HTML 태그(<div>, <br>, <b> 등)는 내용으로 취급하고 구조만 수정해.
 4. 수정된 테이블을 반환해. 수정한 부분만이 아니라 테이블 전체를 반환해야 해.
 5. 마크다운 코드블록(\`\`\`)으로 감싸지 마. 순수 테이블 텍스트만 반환해.
-6. 수정할 것이 없으면 원본을 그대로 반환해.
-7. 설명이나 주석을 추가하지 마. 오직 수정된 테이블만 반환해.
+6. 설명이나 주석을 추가하지 마. 오직 수정된 테이블만 반환해.
+`;
+
+// NEW: Prompts for answer key and explanation extraction
+export const OCR_TEXT_EXTRACTION_PROMPT = `
+Extract all text from this image of a CPA exam answer section.
+
+Look for:
+- Answer keys (e.g., "1.A 2.B 3.C 4.D" or "1. A, 2. B, 3. C")
+- Problem explanations with numbers
+- Any structured answer lists
+
+Return ONLY the extracted text exactly as it appears.
+Do NOT interpret or modify the content.
+`;
+
+export const ANSWER_KEY_EXTRACTION_PROMPT = `
+You are a CPA exam answer key extractor.
+
+I will provide you with text extracted from the end of a CPA exam PDF.
+Your task is to extract the answer key if it exists.
+
+Look for patterns like:
+- "1.A 2.B 3.C 4.D ..."
+- "1. A, 2. B, 3. C, ..."
+- "Answer Key" header followed by numbered answers
+- Any numbered list of answers
+
+Return ONLY a JSON array in this format:
+[
+  {"number": "1", "answer": "A"},
+  {"number": "2", "answer": "B"},
+  ...
+]
+
+If no answer key is found, return an empty array [].
+Do NOT wrap in code blocks. Return raw JSON only.
+`;
+
+export const EXPLANATION_EXTRACTION_PROMPT = `
+You are a CPA exam explanation extractor.
+
+I will provide you with text extracted from the end of a CPA exam PDF.
+Your task is to extract explanations for each problem if they exist.
+
+Look for sections that explain how to solve each problem.
+Each explanation will be associated with a problem number.
+
+Return ONLY a JSON array in this format:
+[
+  {
+    "number": "1",
+    "explanation": "Full explanation text here...",
+    "answer": "A"
+  },
+  ...
+]
+
+If no explanations are found, return an empty array [].
+Do NOT wrap in code blocks. Return raw JSON only.
 `;
