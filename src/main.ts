@@ -4,7 +4,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as pdfjsLib from 'pdfjs-dist';
 // 리팩토링된 모듈 불러오기
-import { ErrorLogSettings, DEFAULT_SETTINGS, UniversalFile, ProblemItem, PdfTextContent, ParsedAnswers, AnswerItem, ExplanationItem } from './types';
+import {
+    ErrorLogSettings, DEFAULT_SETTINGS, UniversalFile, ProblemItem,
+    PreAnalysisInputFile, RenderedPage, PreAnalysisResponse, ParseTarget,
+    PreAnalysisContext, ProgressStatus, PdfTextContent, ParsedAnswers,
+    AnswerItem, ExplanationItem
+} from './types';
 import { TargetFileSuggestModal, MultiSelectModal, ActionSelectModal } from './modals';
 import { ErrorLogSettingTab } from './settings';
 import { DebugLogger } from './utils/logger';
@@ -12,7 +17,7 @@ import { LLMService } from './services/llm-service';
 import { PDFService } from './services/pdf-service';
 import { MarkdownService } from './services/markdown-service';
 import { TableService } from './services/table-service';
-import { OCR_TEXT_EXTRACTION_PROMPT, ANSWER_KEY_EXTRACTION_PROMPT, EXPLANATION_EXTRACTION_PROMPT } from './prompts';
+import { CPA_GRADER_BATCH_PROMPT, OCR_TEXT_EXTRACTION_PROMPT, ANSWER_KEY_EXTRACTION_PROMPT, EXPLANATION_EXTRACTION_PROMPT } from './prompts';
 
 export default class ErrorLogPlugin extends Plugin {
     settings: ErrorLogSettings;
@@ -126,52 +131,96 @@ export default class ErrorLogPlugin extends Plugin {
         // 전체 진행 상태를 관리하는 단일 Notice 객체 생성
         const progressNotice = new Notice('작업 준비 중...', 0);
 
-        try {
-            // 1. PDF를 이미지로 쪼개서 목록 만들기
-            progressNotice.setMessage('PDF 및 이미지 파일 전처리 중입니다...');
-            let processableFiles: UniversalFile[] = [];
+        // Separate PDFs and images - only PDFs go to pre-analysis
+        const pdfFiles = files.filter(f => f.extension.toLowerCase() === 'pdf');
+        const imageFiles = files.filter(f => f.extension.toLowerCase() !== 'pdf');
 
-            for (const file of files) {
-                if (file.extension.toLowerCase() === 'pdf') {
-                    const splitImages = await this.convertPdfToImages(file, assetsFolder, progressNotice);
-                    processableFiles.push(...splitImages);
-                } else {
-                    processableFiles.push(file);
+        try {
+            // Step 4.5: Pre-Analysis (only for PDFs)
+            let preAnalysisContext: PreAnalysisContext | null = null;
+            // Map from page number to image path for pre-processed content
+            const preAnalysisImageMap: Map<number, string> = new Map();
+            
+            if (pdfFiles.length > 0) {
+                progressNotice.setMessage('Pre-Analysis 시작: PDF 내용 분석 중...');
+                try {
+                    preAnalysisContext = await this.performPreAnalysis(
+                        pdfFiles,
+                        assetsFolder,
+                        progressNotice
+                    );
+
+                    if (preAnalysisContext) {
+                        progressNotice.setMessage(`Pre-Analysis 완료: ${preAnalysisContext.answers.length}개의 정답, ${preAnalysisContext.processedContent.length}개의 해설 찾음`);
+                    } else {
+                        progressNotice.setMessage('Pre-Analysis 스킵 - 기본 처리 모드 진행');
+                    }
+                } catch (error) {
+                    // Silent fallback
+                    console.warn('Pre-analysis failed, falling back to original behavior');
+                    progressNotice.setMessage('Pre-Analysis 스킵 - 기본 처리 모드 진행');
                 }
             }
 
-            if (processableFiles.length === 0) {
+            // Step 5: Preprocessing - Convert PDFs to images (if needed) and prepare files
+            progressNotice.setMessage('PDF 및 이미지 파일 전처리 중입니다...');
+            let processableFiles: UniversalFile[] = [...imageFiles];
+
+            if (pdfFiles.length > 0) {
+                if (preAnalysisContext && preAnalysisContext.progressStatus.remaining.length > 0) {
+                    // Only render remaining pages that weren't processed in pre-analysis
+                    for (const pdfFile of pdfFiles) {
+                        const remainingImages = await this.renderRemainingPdfPages(
+                            pdfFile,
+                            preAnalysisContext.progressStatus.remaining,
+                            assetsFolder,
+                            progressNotice
+                        );
+                        processableFiles.push(...remainingImages);
+                    }
+                } else {
+                    // Render all PDF pages (fallback or when no pre-analysis context)
+                    for (const pdfFile of pdfFiles) {
+                        const splitImages = await this.convertPdfToImages(pdfFile, assetsFolder, progressNotice);
+                        processableFiles.push(...splitImages);
+                    }
+                }
+            }
+
+            if (processableFiles.length === 0 && (!preAnalysisContext || preAnalysisContext.processedContent.length === 0)) {
                 progressNotice.hide();
                 new Notice("⚠️ 처리할 이미지가 없습니다.", 5000);
                 return;
             }
 
-            let allProblems: ProblemItem[] = [];
-            const CHUNK_SIZE = 2; // 한 번에 API에 전송할 이미지 수
+            let allProblems: ProblemItem[] = [...(preAnalysisContext?.processedContent || [])];
+            const CHUNK_SIZE = 2;
             const totalChunks = Math.ceil(processableFiles.length / CHUNK_SIZE);
 
-            progressNotice.setMessage(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
+            if (totalChunks > 0) {
+                progressNotice.setMessage(`총 ${processableFiles.length}장, ${totalChunks}번의 묶음 분석을 시작합니다! 🏃`);
 
-            // 2. Chunk 단위로 묶어서 LLM 통신
-            for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-                const start = chunkIdx * CHUNK_SIZE;
-                const end = start + CHUNK_SIZE;
-                const chunkFiles = processableFiles.slice(start, end);
+                // Step 6: Batch Analysis
+                for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+                    const start = chunkIdx * CHUNK_SIZE;
+                    const end = start + CHUNK_SIZE;
+                    const chunkFiles = processableFiles.slice(start, end);
 
-                progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] AI 분석 중... (${chunkFiles.length}장 처리)`);
+                    progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] AI 분석 중... (${chunkFiles.length}장 처리)`);
 
-                const problems = await this.fetchProblemsFromLLM(chunkFiles);
-                if (problems && problems.length > 0) {
-                    allProblems.push(...problems);
-                }
+                    const problems = await this.fetchProblemsFromLLM(chunkFiles, preAnalysisContext);
+                    if (problems && problems.length > 0) {
+                        allProblems.push(...problems);
+                    }
 
-                if (chunkIdx < totalChunks - 1) {
-                    progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] API 쿨타임 대기 중...`);
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    if (chunkIdx < totalChunks - 1) {
+                        progressNotice.setMessage(`[묶음 ${chunkIdx + 1}/${totalChunks}] API 쿨타임 대기 중...`);
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    }
                 }
             }
 
-            // 3. 분석 결과 파일에 저장
+            // Step 7: Save to markdown
             if (allProblems.length > 0) {
                 progressNotice.setMessage(`분석 완료! 마크다운 파일 생성 중... 📝`);
                 await this.saveToMarkdown(allProblems, targetPath);
@@ -213,7 +262,11 @@ export default class ErrorLogPlugin extends Plugin {
     }
 
     // 묶음 단위(Batch)로 LLM에 전송하고 결과를 매핑하는 함수
-    async fetchProblemsFromLLM(files: UniversalFile[]): Promise<ProblemItem[] | null> {
+    // Updated to accept optional pre-analysis context for enhanced batch processing
+    async fetchProblemsFromLLM(
+        files: UniversalFile[],
+        preAnalysisContext: PreAnalysisContext | null
+    ): Promise<ProblemItem[] | null> {
         // Read binary helper for LLM service
         const readImageBinary = async (file: UniversalFile): Promise<string> => {
             let base64Data = "";
@@ -229,7 +282,308 @@ export default class ErrorLogPlugin extends Plugin {
             return base64Data;
         };
 
-        return this.llmService.fetchProblemsFromLLM(files, readImageBinary);
+        return this.llmService.fetchProblemsFromLLM(files, readImageBinary, preAnalysisContext);
+    }
+
+    /**
+     * Step 4.5: Pre-Analysis - Extract answers/explanations from PDFs before batch processing
+     * Only processes PDF files, not standalone images
+     */
+    private async performPreAnalysis(
+        pdfFiles: UniversalFile[],
+        assetsFolder: string,
+        progressNotice: Notice
+    ): Promise<PreAnalysisContext | null> {
+        progressNotice.setMessage('Pre-Analysis 시작: 답변/해설 추출 중...');
+
+        // Build pre-analysis inputs (only PDFs) and track page-to-image mapping
+        const preAnalysisInputs: PreAnalysisInputFile[] = [];
+        // Map from sequential index to {imagePath, page}
+        const pageIndexToImage: Map<number, { imagePath: string; page: number }> = new Map();
+        let currentPage = 0;
+
+        for (const file of pdfFiles) {
+            // Render PDF pages to images for pre-analysis (lower resolution for speed)
+            const renderedResults = await this.renderPagesForPreAnalysis(file, assetsFolder);
+            if (renderedResults.length > 0) {
+                const pagesWithContext: RenderedPage[] = renderedResults.map((r, i) => ({
+                    ...r.page,
+                    pageNumber: currentPage + i
+                }));
+                
+                preAnalysisInputs.push({
+                    fileName: file.path.split('/').pop() || file.name,
+                    fileType: 'pdf',
+                    pages: pagesWithContext,
+                    startPage: currentPage,
+                    endPage: currentPage + renderedResults.length - 1
+                });
+
+                // Track page-to-image mapping
+                for (const r of renderedResults) {
+                    pageIndexToImage.set(r.page.pageNumber, {
+                        imagePath: r.imagePath,
+                        page: r.pageNum
+                    });
+                }
+                
+                currentPage += renderedResults.length;
+            }
+        }
+
+        if (preAnalysisInputs.length === 0) {
+            return null; // Nothing to analyze
+        }
+
+        // Call Pre-Analysis Gemini
+        progressNotice.setMessage(`Pre-Analysis 진행 중... (${currentPage} 페이지 처리)`);
+
+        const preAnalysisResponse = await this.llmService.preAnalysis(preAnalysisInputs);
+
+        if (!preAnalysisResponse) {
+            progressNotice.setMessage('Pre-Analysis 실패 - fallback 모드 진행');
+            return null; // Fallback: return null, continue to normal processing
+        }
+
+        // Update processedContent with imagePath and page from the mapping
+        for (const item of preAnalysisResponse.processedContent) {
+            const imageIndex = item.image_index || 0;
+            const mapping = pageIndexToImage.get(imageIndex);
+            if (mapping) {
+                item.imagePath = mapping.imagePath;
+                item.page = mapping.page;
+            }
+        }
+
+        // Build PreAnalysisContext from response
+        const context: PreAnalysisContext = {
+            answers: preAnalysisResponse.answers,
+            parseTarget: preAnalysisResponse.parseTarget,
+            processedContent: preAnalysisResponse.processedContent,
+            progressStatus: preAnalysisResponse.progressStatus
+        };
+
+        return context;
+    }
+
+    /**
+     * Render only specific pages from a PDF for final processing
+     * Used when pre-analysis already processed some pages
+     */
+    private async renderRemainingPdfPages(
+        pdfFile: UniversalFile,
+        remainingPages: number[],
+        targetFolder: string,
+        sharedNotice?: Notice
+    ): Promise<UniversalFile[]> {
+        const generatedImages: UniversalFile[] = [];
+        let pdfDocument: any = null;
+
+        try {
+            let pdfData: Buffer;
+            if (pdfFile.isExternal) {
+                pdfData = fs.readFileSync(pdfFile.path);
+            } else {
+                const fileObj = this.app.vault.getAbstractFileByPath(pdfFile.path);
+                if (fileObj instanceof TFile) {
+                    pdfData = Buffer.from(await this.app.vault.readBinary(fileObj));
+                } else {
+                    return [];
+                }
+            }
+
+            if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+                pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+            }
+
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(pdfData),
+                disableFontFace: false
+            });
+
+            pdfDocument = await loadingTask.promise;
+            const numPages = pdfDocument.numPages;
+
+            // Pre-analysis uses 2x scale, final render uses 4x scale
+            const scale = 4.0;
+            const progressNotice = sharedNotice;
+
+            for (const preAnalysisIndex of remainingPages) {
+                // Convert pre-analysis index (0-based) to PDF page number (1-based)
+                const pdfPageNum = preAnalysisIndex + 1;
+                
+                if (pdfPageNum < 1 || pdfPageNum > numPages) continue;
+
+                const page = await pdfDocument.getPage(pdfPageNum);
+                const viewport = page.getViewport({ scale });
+
+                const canvas = this.createCanvas(viewport.width, viewport.height);
+                const context = canvas.getContext('2d', { alpha: false });
+
+                if (!context) continue;
+
+                await page.render({ canvasContext: context, viewport }).promise;
+
+                const dataUrl = canvas.toDataURL('image/png');
+                const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
+                const buffer = Buffer.from(base64Data, 'base64');
+
+                const originalName = path.basename(pdfFile.path, '.pdf').replace(/[^a-zA-Z0-9가-힣]/g, '_');
+                const newFileName = `${Date.now()}_${originalName}_final_p${pdfPageNum}.png`;
+                const newInternalPath = `${targetFolder}/${newFileName}`;
+
+                const createdFile = await this.app.vault.createBinary(newInternalPath, buffer);
+
+                generatedImages.push({
+                    name: createdFile.name || createdFile.path?.split('/').pop() || newFileName,
+                    path: createdFile.path || newInternalPath,
+                    mtime: createdFile.stat?.mtime || Date.now(),
+                    isExternal: false,
+                    extension: 'png',
+                    originalObject: createdFile
+                });
+
+                canvas.width = 0;
+                canvas.height = 0;
+                page.cleanup();
+            }
+
+            return generatedImages;
+
+        } catch (error) {
+            console.error("PDF render for remaining pages failed:", error);
+            return [];
+        } finally {
+            if (pdfDocument) {
+                try {
+                    await pdfDocument.destroy();
+                } catch (e) {
+                    // Ignore destroy errors
+                }
+            }
+        }
+    }
+
+    /**
+     * Render PDF pages for Pre-Analysis (lower resolution than final processing)
+     * Saves rendered pages to files and returns them with page numbers
+     */
+    private async renderPagesForPreAnalysis(
+        pdfFile: UniversalFile,
+        targetFolder: string
+    ): Promise<{ page: RenderedPage; imagePath: string; pageNum: number }[]> {
+        const results: { page: RenderedPage; imagePath: string; pageNum: number }[] = [];
+        let pdfDocument: any = null;
+
+        try {
+            let pdfData: Buffer;
+            if (pdfFile.isExternal) {
+                pdfData = fs.readFileSync(pdfFile.path);
+            } else {
+                const fileObj = this.app.vault.getAbstractFileByPath(pdfFile.path);
+                if (fileObj instanceof TFile) {
+                    pdfData = Buffer.from(await this.app.vault.readBinary(fileObj));
+                } else {
+                    return [];
+                }
+            }
+
+            if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+                pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+            }
+
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(pdfData),
+                disableFontFace: false
+            });
+
+            pdfDocument = await loadingTask.promise;
+            const numPages = pdfDocument.numPages;
+
+            // Use lower scale (2.0) for faster pre-analysis
+            const scale = 2.0;
+
+            for (let i = 0; i < numPages; i++) {
+                const page = await pdfDocument.getPage(i + 1);
+                const viewport = page.getViewport({ scale });
+
+                const canvas = this.createCanvas(viewport.width, viewport.height);
+                const context = canvas.getContext('2d', { alpha: false });
+
+                if (!context) continue;
+
+                await page.render({ canvasContext: context, viewport }).promise;
+
+                const dataUrl = canvas.toDataURL('image/png');
+                const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
+
+                // Save the rendered page to a file
+                const originalName = path.basename(pdfFile.path, '.pdf').replace(/[^a-zA-Z0-9가-힣]/g, '_');
+                const fileName = `${Date.now()}_${originalName}_pre_p${i + 1}.png`;
+                const internalPath = `${targetFolder}/${fileName}`;
+                
+                const createdFile = await this.app.vault.createBinary(internalPath, Buffer.from(base64Data, 'base64'));
+
+                results.push({
+                    page: {
+                        pageNumber: i,
+                        imageData: base64Data,
+                        mimeType: 'image/png'
+                    },
+                    imagePath: createdFile.path || internalPath,
+                    pageNum: i + 1 // 1-based page number
+                });
+
+                canvas.width = 0;
+                canvas.height = 0;
+                page.cleanup();
+            }
+
+            return results;
+
+        } catch (error) {
+            console.error("PDF render for pre-analysis failed:", error);
+            return [];
+        } finally {
+            if (pdfDocument) {
+                try {
+                    await pdfDocument.destroy();
+                } catch (e) {
+                    // Ignore destroy errors
+                }
+            }
+        }
+    }
+
+    /**
+     * Convert standalone image to PreAnalysisPage format
+     */
+    private async imageToPreAnalysisPage(
+        imageFile: UniversalFile,
+        pageNumber: number
+    ): Promise<RenderedPage | null> {
+        try {
+            let base64Data = '';
+
+            if (imageFile.isExternal) {
+                const bitmap = fs.readFileSync(imageFile.path);
+                base64Data = Buffer.from(bitmap).toString('base64');
+            } else if (imageFile.originalObject) {
+                const arrayBuffer = await this.app.vault.readBinary(imageFile.originalObject as TFile);
+                base64Data = Buffer.from(arrayBuffer).toString('base64');
+            } else {
+                return null;
+            }
+
+            return {
+                pageNumber,
+                imageData: base64Data,
+                mimeType: 'image/png'
+            };
+        } catch (error) {
+            console.error("Image to pre-analysis page failed:", error);
+            return null;
+        }
     }
 
     async convertPdfToImages(pdfFile: UniversalFile, targetFolder: string, sharedNotice?: Notice): Promise<UniversalFile[]> {

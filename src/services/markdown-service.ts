@@ -47,6 +47,10 @@ export class MarkdownService {
             const safeNumber = this.sanitizeForTable(item.number || "");
             const scrollableSolution = `<div class="cpa-solution cpa-text">${safeSolution}</div>`;
 
+            // Add page number to remarks if available
+            const pageRemark = item.page ? `P${item.page}` : '';
+            const remarkColumn = pageRemark ? `${pageRemark}` : '';
+
             const showImage = (item.imagePath !== currentPath);
             currentPath = item.imagePath;
 
@@ -81,7 +85,7 @@ export class MarkdownService {
                     imgTag = `❌ 이미지 로드 실패`;
                 }
             }
-            chunk += `| ${safeSubject} | ${imgTag} | ${safeNumber}: ${safeAnswer} | ${scrollableSolution} |  |\n`;
+            chunk += `| ${safeSubject} | ${imgTag} | ${safeNumber}: ${safeAnswer} | ${scrollableSolution} |  ${remarkColumn} |\n`;
         }
 
         if (!fileExists) {

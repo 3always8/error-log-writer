@@ -1,7 +1,10 @@
 import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { TFile } from 'obsidian';
-import { UniversalFile, ProblemItem } from '../types';
-import { CPA_GRADER_BATCH_PROMPT, TABLE_FIX_PROMPT } from '../prompts';
+import {
+    UniversalFile, ProblemItem, PreAnalysisResponse, PreAnalysisContext,
+    AnswerItem, ParseTarget, ProgressStatus, RenderedPage, PreAnalysisInputFile
+} from '../types';
+import { CPA_GRADER_BATCH_PROMPT, TABLE_FIX_PROMPT, PRE_ANALYSIS_PROMPT, EXPLANATION_BATCH_PROMPT } from '../prompts';
 import { DebugLogger } from '../utils/logger';
 import * as fs from 'fs';
 
@@ -24,16 +27,46 @@ export class LLMService {
      * Send images to LLM for problem extraction and return parsed problems.
      * @param files - Array of universal files (images or PDFs converted to images)
      * @param readImageBinary - Function to read binary data for a file
+     * @param preAnalysisContext - Optional pre-analysis context with extracted answers
      * @returns Array of extracted problems, or null on failure
      */
     async fetchProblemsFromLLM(
         files: UniversalFile[],
-        readImageBinary: (file: UniversalFile) => Promise<string>
+        readImageBinary: (file: UniversalFile) => Promise<string>,
+        preAnalysisContext?: PreAnalysisContext | null
     ): Promise<ProblemItem[] | null> {
         await this.logger.log("LLM_BATCH_START", `Batch 요청 시작. 처리할 파일 수: ${files.length}`);
 
         try {
-            const promptParts: any[] = [CPA_GRADER_BATCH_PROMPT];
+            // Determine which prompt to use based on pre-analysis context
+            let batchPrompt = CPA_GRADER_BATCH_PROMPT;
+            let useExplanationPrompt = false;
+
+            if (preAnalysisContext) {
+                // Use explanation batch prompt if parseTarget indicates explanation pages
+                if (preAnalysisContext.parseTarget === 'explanation-pages' || preAnalysisContext.parseTarget === 'both') {
+                    useExplanationPrompt = true;
+                }
+
+                // Format known answers as prefix text
+                let knownAnswersText = '';
+                if (preAnalysisContext.answers.length > 0) {
+                    knownAnswersText = preAnalysisContext.answers
+                        .map(a => `${a.number}.${a.answer}`)
+                        .join(', ');
+                }
+
+                if (useExplanationPrompt) {
+                    batchPrompt = EXPLANATION_BATCH_PROMPT.replace('{knownAnswersText}', knownAnswersText || 'None');
+                } else {
+                    // Standard batch with known answers as context
+                    if (knownAnswersText) {
+                        batchPrompt = `[Known answers: ${knownAnswersText}]\n\n${CPA_GRADER_BATCH_PROMPT}`;
+                    }
+                }
+            }
+            
+            const promptParts: any[] = [batchPrompt];
 
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
@@ -108,6 +141,117 @@ export class LLMService {
         } catch (error) {
             await this.logger.log("LLM_API_ERROR", `Batch API 호출 실패`, error);
             console.error(`Batch API 호출 실패:`, error);
+            return null;
+        }
+    }
+
+    /**
+     * Pre-Analysis: Receive raw images, extract answers/explanations, determine parse target
+     * @param inputs - Array of pre-analysis inputs with sequential page numbers
+     * @returns PreAnalysisResponse or null on failure (fallback behavior)
+     */
+    async preAnalysis(
+        inputs: PreAnalysisInputFile[]
+    ): Promise<PreAnalysisResponse | null> {
+        const totalPages = inputs.reduce((sum, i) => sum + i.pages.length, 0);
+        await this.logger.log("PRE_ANALYSIS_START", `Pre-Analysis 시작. 총 페이지 수: ${totalPages}`);
+
+        try {
+            // Build prompt parts using PRE_ANALYSIS_PROMPT
+            const promptParts: any[] = [PRE_ANALYSIS_PROMPT];
+
+            // Assign sequential image indices across all inputs
+            let imageIndex = 0;
+            for (const input of inputs) {
+                for (const page of input.pages) {
+                    promptParts.push({ text: `\n--- [Image Index: ${imageIndex}] ---\n` });
+                    promptParts.push({ inlineData: { data: page.imageData, mimeType: page.mimeType } });
+                    imageIndex++;
+                }
+            }
+
+            // Generate content
+            const result = await this.model.generateContent(promptParts);
+            const textResponse = result.response.text();
+
+            await this.logger.log("PRE_ANALYSIS_RESPONSE", `Pre-Analysis 응답 수신`, textResponse);
+
+            // Parse response
+            const parsed = this.parsePreAnalysisResponse(textResponse);
+
+            if (parsed) {
+                await this.logger.log("PRE_ANALYSIS_SUCCESS", `Pre-Analysis 완료`, {
+                    parseTarget: parsed.parseTarget,
+                    answersCount: parsed.answers.length,
+                    processedContentCount: parsed.processedContent.length,
+                    progressStatus: parsed.progressStatus
+                });
+            } else {
+                await this.logger.log("PRE_ANALYSIS_FAILED", `Pre-Analysis 실패 - fallback 활성화`);
+            }
+
+            return parsed;
+
+        } catch (error) {
+            await this.logger.log("PRE_ANALYSIS_ERROR", `Pre-Analysis API 실패`, error);
+            console.error(`Pre-Analysis API 호출 실패:`, error);
+            return null; // Fallback: return null, caller handles it
+        }
+    }
+
+    /**
+     * Parse Pre-Analysis JSON response
+     * Handles the simplified format with done/remaining progressStatus
+     */
+    private parsePreAnalysisResponse(text: string): PreAnalysisResponse | null {
+        try {
+            const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+            const start = clean.indexOf('{');
+            const end = clean.lastIndexOf('}');
+            if (start === -1 || end === -1) throw new Error("JSON object brackets not found");
+
+            let jsonStr = clean.substring(start, end + 1);
+            const parsed = JSON.parse(jsonStr) as PreAnalysisResponse;
+
+            // Validate and normalize required fields
+            if (!parsed.answers) parsed.answers = [];
+            if (!parsed.parseTarget) parsed.parseTarget = 'none';
+            
+            // Ensure progressStatus has the correct format
+            if (!parsed.progressStatus) {
+                throw new Error("Missing progressStatus");
+            }
+
+            // Handle both old and new progressStatus formats
+            let progressStatus: ProgressStatus;
+            const ps = parsed.progressStatus as any;
+            
+            if (ps.done !== undefined && ps.remaining !== undefined) {
+                // New format
+                progressStatus = {
+                    done: Array.isArray(ps.done) ? ps.done : [],
+                    remaining: Array.isArray(ps.remaining) ? ps.remaining : [],
+                    description: ps.description || ''
+                };
+            } else if (ps.pageNumbers !== undefined) {
+                // Old format - convert to new format
+                const totalPages = ps.totalPages || ps.pageNumbers.length;
+                progressStatus = {
+                    done: ps.pageNumbers || [],
+                    remaining: Array.from({ length: totalPages }, (_, i) => i).filter(i => !(ps.pageNumbers || []).includes(i)),
+                    description: ps.status === 'completed' ? 'all processed' : 'processing needed'
+                };
+            } else {
+                throw new Error("Invalid progressStatus format");
+            }
+
+            if (!parsed.processedContent) parsed.processedContent = [];
+            parsed.progressStatus = progressStatus;
+
+            return parsed;
+
+        } catch (e) {
+            console.error("Pre-Analysis JSON parse error:", e);
             return null;
         }
     }

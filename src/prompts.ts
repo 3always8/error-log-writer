@@ -108,7 +108,7 @@ Return ONLY a JSON array in this format:
 [
   {
     "number": "1",
-    "explanation": "Full explanation text here...",
+    "explanation": "Full explanation text here translated to Korean...",
     "answer": "A"
   },
   ...
@@ -116,4 +116,103 @@ Return ONLY a JSON array in this format:
 
 If no explanations are found, return an empty array [].
 Do NOT wrap in code blocks. Return raw JSON only.
+`;
+
+// ===== Pre-Analysis Prompt (Step 4.5) =====
+
+/**
+ * Pre-analysis prompt sent to Gemini to extract answers, determine parse target,
+ * and optionally process explanation pages before batch analysis.
+ */
+export const PRE_ANALYSIS_PROMPT = `
+너는 CPA 시험 문서 분석 전문가야.
+
+내가 여러 장의 시험지 이미지를 제공할 거야.
+각 이미지 앞에는 "[Image Index: 0]" 처럼 해당 이미지의 번호(인덱스)가 텍스트로 주어져.
+
+[네가 할 일]
+1. **정답 추출**: 답안지가 있으면 모든 정답을 추출해.
+   - 예: "1.A 2.B 3.C 4.D ..."
+   
+2. **해설 추출**: 해설이 있으면:
+    - 해설을 추출한 뒤 Korean으로 번역해서 processedContent에 포함해
+    - 문제 번호와 정답을 명시
+    - 핵심 용어와 표현은 영어로 유지 (예: "재고자산(evaluated at lower of cost or market)")
+   
+3. **Parse Target 결정**:
+   - "explanation-pages": 답안지/해설이 있는 페이지들 (이미 해결됨)
+   - "question-pages": 풀어야 할 문제만 있는 페이지들 (아직 처리 안 됨)
+   - "both": 둘 다 있음
+   - "none": 아무것도 없음
+
+4. **Progress Status**: 각 페이지가 처리됨/남았음 표시
+
+[출력 형식 - JSON만 반환]
+마크다운 코드블록 없이 순수 JSON만 반환:
+
+{
+  "answers": [{"number": "1", "answer": "A"}],
+  "parseTarget": "explanation-pages" | "question-pages" | "both" | "none",
+  "processedContent": [
+    {
+      "image_index": 0,
+      "page": 1,
+      "subject": "과목명 > 단원명",
+      "number": "41번",
+      "solution": "한국어 해설 (줄바꿈은 <br> 사용, 핵심 용어는 영어 허용)",
+      "answer": "A. $700"
+    }
+  ],
+  "progressStatus": {
+    "done": [0, 1],
+    "remaining": [2, 3, 4],
+    "description": "question pages"
+  }
+}
+
+[중요 규칙]
+- answers는 반드시 먼저, 완전히 반환 (always return answers first)
+- processedContent는 가능한 많이 채워 (most of token budget)
+- progressStatus는 processedContent의 내용을 정확히 반영
+- 줄바꿈은 '<br>' 사용, '|' 기호 절대 사용 금지
+- LaTeX 수식 사용 금지, 곱하기는 "x", 나누기는 "/"
+- 해설은 한국어로 작성 (핵심 용어와 표현은 영어 허용)
+- image_index는 이미지에 붙인 번호와 동일해야 함
+- page는 1-based PDF 페이지 번호 (예: image_index 0이 1페이지면 page: 1)
+`;
+
+/**
+ * Batch analysis prompt used when parseTarget = "explanation-pages"
+ * This prompt focuses on extracting explanations in Korean.
+ */
+export const EXPLANATION_BATCH_PROMPT = `
+You are a CPA exam explanation extractor.
+
+I will provide you with images containing Korean exam explanations.
+Your job is to extract problem information and keep the explanations in Korean.
+
+[Known Answers]
+{knownAnswersText}
+
+[Instructions]
+1. Extract subject, problem number, and answer from each image
+2. Keep explanations in Korean (핵심 용어와 표현은 영어 허용)
+3. Use <br> for line breaks, NEVER use '|' character
+
+[Output Format - JSON Array Only, no code blocks]
+[
+  {
+    "image_index": 0,
+    "page": 1,
+    "subject": "과목명 > 단원명",
+    "number": "41번",
+    "solution": "한국어 해설 (줄바꿈은 <br> 사용, 핵심 용어는 영어 허용)",
+    "answer": "A. $700"
+  }
+]
+
+[Rules]
+- Use "x" for multiplication, "/" for division
+- NEVER use LaTeX math notation
+- Keep explanations in Korean while allowing key CPA terminology in English
 `;
